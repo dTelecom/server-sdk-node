@@ -1,0 +1,65 @@
+{
+  "name": "@dtelecom/server-sdk-node",
+  "version": "0.1.0",
+  "description": "Node.js RTC SDK for dTelecom — WebRTC participant for AI bots",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "format": "prettier --write src"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.9.0",
+    "opusscript": "^0.1.1",
+    "protobufjs": "^7.5.0",
+    "werift": "^0.19.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "prettier": "^3.4.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "peerDependencies": {
+    "@dtelecom/server-sdk-js": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@dtelecom/server-sdk-js": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dTelecom/server-sdk-node"
+  },
+  "keywords": [
+    "dtelecom",
+    "webrtc",
+    "rtc",
+    "audio",
+    "bot",
+    "ai",
+    "opus",
+    "node"
+  ]
+}
