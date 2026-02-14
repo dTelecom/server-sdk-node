@@ -127,26 +127,57 @@ export class LocalAudioTrack {
   setTransceiver(transceiver: RTCRtpTransceiver): void {
     this.transceiver = transceiver;
 
-    // Wire up AudioSource to send encoded Opus frames via RTP through the MediaStreamTrack.
-    // werift's sender subscribes to mediaTrack.onReceiveRtp and transmits automatically.
-    this.source.onEncodedFrame = (opusData: Buffer) => {
-      if (this.mediaTrack.stopped) return;
+    const sender = transceiver.sender as any;
+    const dtlsState = sender?.dtlsTransport?.state;
+    log.info(`setTransceiver: mid=${transceiver.mid}, codec=${sender?.codec?.name}, dtls=${dtlsState}`);
 
-      try {
-        const info = this.packetizer.nextPacketInfo();
-        const header = new RtpHeader();
-        header.payloadType = OPUS_PAYLOAD_TYPE;
-        header.sequenceNumber = info.sequenceNumber;
-        header.timestamp = info.timestamp;
-        header.ssrc = info.ssrc;
-        header.marker = false;
+    // Wire up AudioSource → RTP, but only start sending once DTLS is connected
+    const wireAudio = () => {
+      let rtpWriteCount = 0;
+      log.info(`Audio wired: dtls=${sender?.dtlsTransport?.state}, codec=${sender?.codec?.name}`);
 
-        const packet = new RtpPacket(header, opusData);
-        this.mediaTrack.writeRtp(packet);
-      } catch (err) {
-        log.error('Failed to send RTP via track', err);
-      }
+      this.source.onEncodedFrame = (opusData: Buffer) => {
+        if (this.mediaTrack.stopped) return;
+
+        try {
+          const info = this.packetizer.nextPacketInfo();
+          const header = new RtpHeader();
+          header.payloadType = OPUS_PAYLOAD_TYPE;
+          header.sequenceNumber = info.sequenceNumber;
+          header.timestamp = info.timestamp;
+          header.ssrc = info.ssrc;
+          header.marker = false;
+
+          const packet = new RtpPacket(header, opusData);
+          this.mediaTrack.writeRtp(packet);
+          rtpWriteCount++;
+          if (rtpWriteCount === 1) {
+            log.info(`First RTP sent: dtls=${sender?.dtlsTransport?.state}`);
+          }
+        } catch (err) {
+          log.error('Failed to send RTP via track', err);
+        }
+      };
     };
+
+    if (dtlsState === 'connected') {
+      wireAudio();
+    } else {
+      // Wait for DTLS to connect before sending any audio
+      const dtls = sender?.dtlsTransport;
+      if (dtls?.onStateChange) {
+        const { unSubscribe } = dtls.onStateChange.subscribe((state: string) => {
+          if (state === 'connected') {
+            unSubscribe();
+            wireAudio();
+          }
+        });
+      } else {
+        // Fallback: wire immediately if we can't subscribe to DTLS events
+        log.warn('Cannot subscribe to DTLS state changes, wiring audio immediately');
+        wireAudio();
+      }
+    }
   }
 
   /** Stop the track and release resources */

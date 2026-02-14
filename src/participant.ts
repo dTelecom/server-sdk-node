@@ -131,10 +131,15 @@ export class LocalParticipant extends Participant {
 
     // Step 3: Add transceiver to publisher PC with the media track
     const transceiver = await this.engine.addTransceiver(track.mediaTrack);
-    track.setTransceiver(transceiver);
 
-    // Step 4: Negotiate
+    // Step 4: Negotiate (waits for SDP answer)
     await this.engine.negotiate();
+
+    // Step 5: Wait for publisher ICE+DTLS to connect before wiring audio
+    await this.engine.waitForPublisherConnected();
+
+    // Step 6: Wire audio source to transceiver (only after media path is ready)
+    track.setTransceiver(transceiver);
 
     // Create publication
     const publication = new LocalTrackPublication(response.track, track);

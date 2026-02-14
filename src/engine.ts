@@ -61,6 +61,8 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
   private joinResponse: JoinResponse | null = null;
 
   private publishWaiters: Map<string, (response: TrackPublishedResponse) => void> = new Map();
+  private _negotiateResolve: (() => void) | null = null;
+  private _publisherConnectedResolve: (() => void) | null = null;
 
   get isConnected(): boolean {
     return this._isConnected;
@@ -154,10 +156,45 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     const offer = await this.publisher.createOffer();
     await this.publisher.setLocalDescription(offer);
 
+    // Create a promise that resolves when the answer is applied
+    const answerPromise = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Timed out waiting for publisher answer'));
+      }, 10000);
+      this._negotiateResolve = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
+    });
+
     log.debug('Sending publisher offer');
     this.signal.sendOffer({
       type: offer.type,
       sdp: offer.sdp,
+    });
+
+    // Wait for the answer to be set on the publisher PC
+    await answerPromise;
+    log.debug('Negotiate complete (answer applied)');
+  }
+
+  /** Wait for publisher ICE to reach connected state (DTLS+SRTP ready). */
+  async waitForPublisherConnected(timeoutMs: number = 10000): Promise<void> {
+    if (!this.publisher) throw new Error('Publisher PC not initialized');
+
+    const iceState = this.publisher.iceConnectionState;
+    if (iceState === 'connected' || iceState === 'completed') {
+      return; // Already connected
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Publisher ICE timed out (state: ${this.publisher?.iceConnectionState})`));
+      }, timeoutMs);
+      this._publisherConnectedResolve = () => {
+        clearTimeout(timeout);
+        resolve();
+      };
     });
   }
 
@@ -228,6 +265,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
 
     this.publisher.iceConnectionStateChange.subscribe((state) => {
       log.debug(`Publisher ICE state: ${state}`);
+      if (state === 'connected' || state === 'completed') {
+        if (this._publisherConnectedResolve) {
+          this._publisherConnectedResolve();
+          this._publisherConnectedResolve = null;
+        }
+      }
     });
 
     log.debug('Publisher PC created');
@@ -368,6 +411,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
         log.debug('Set publisher remote description');
 
         this.flushPendingCandidates(SignalTarget.PUBLISHER);
+
+        // Resolve negotiate() promise
+        if (this._negotiateResolve) {
+          this._negotiateResolve();
+          this._negotiateResolve = null;
+        }
       } catch (err) {
         log.error('Failed to handle publisher answer', err);
       }

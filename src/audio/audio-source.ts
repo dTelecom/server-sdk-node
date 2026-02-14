@@ -110,6 +110,9 @@ export class AudioSource {
     this.track = null;
   }
 
+  private _rtpCount = 0;
+  private _warnedNoCallback = false;
+
   private encodeAndSend(pcm: Int16Array): void {
     if (!this.encoder) return;
 
@@ -118,6 +121,13 @@ export class AudioSource {
 
       if (this._onEncodedFrame) {
         this._onEncodedFrame(opusData);
+        this._rtpCount++;
+        if (this._rtpCount === 1) {
+          log.info(`First RTP packet sent (${opusData.byteLength} bytes)`);
+        }
+      } else if (!this._warnedNoCallback) {
+        this._warnedNoCallback = true;
+        log.debug('Waiting for DTLS — buffered audio will be dropped');
       }
     } catch (err) {
       log.error('Opus encode failed', err);
