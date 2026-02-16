@@ -66,12 +66,26 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
     return this.queue[Symbol.asyncIterator]();
   }
 
+  /** SSRC of the first RTP packet received (for diagnostics) */
+  private firstSsrc: number | null = null;
+  private packetCount = 0;
+
   private start(): void {
     if (!this.track) return;
+
+    const trackUuid = (this.track as any).uuid ?? '?';
 
     // Listen for RTP packets on the track
     this.track.onReceiveRtp.subscribe((rtpPacket: RtpPacket) => {
       if (this._closed) return;
+
+      this.packetCount++;
+      if (this.firstSsrc === null) {
+        this.firstSsrc = rtpPacket.header.ssrc;
+        log.info(`AudioStream first RTP: ssrc=${this.firstSsrc}, trackUuid=${trackUuid}`);
+      } else if (rtpPacket.header.ssrc !== this.firstSsrc && this.packetCount < 20) {
+        log.warn(`AudioStream SSRC changed: ${this.firstSsrc} → ${rtpPacket.header.ssrc}, trackUuid=${trackUuid}`);
+      }
 
       try {
         this.processRtpPacket(rtpPacket);
@@ -86,7 +100,7 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
       // we rely on the Room/Participant layer to call close()
     });
 
-    log.debug(`AudioStream started, output: ${this.outputSampleRate}Hz ${this.outputChannels}ch`);
+    log.debug(`AudioStream started, output: ${this.outputSampleRate}Hz ${this.outputChannels}ch, trackUuid=${trackUuid}`);
   }
 
   private processRtpPacket(rtp: RtpPacket): void {
