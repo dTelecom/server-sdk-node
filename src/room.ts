@@ -25,7 +25,6 @@ import {
   Room as RoomInfo,
   ParticipantInfo,
   ParticipantInfo_State,
-  TrackType,
   DataPacket,
   DataPacket_Kind,
   UserPacket,
@@ -38,6 +37,22 @@ import {
 } from './proto/signal';
 
 const log = createLogger('Room');
+
+/**
+ * Unpack the SFU-assigned stream ID.
+ * The SFU packs "participantSid|trackSid" into the msid stream ID attribute.
+ * Same logic as Go SDK's unpackStreamID (room.go).
+ */
+export function unpackStreamId(packed: string): { participantSid: string; trackSid: string } {
+  const pipeIndex = packed.indexOf('|');
+  if (pipeIndex >= 0) {
+    return {
+      participantSid: packed.substring(0, pipeIndex),
+      trackSid: packed.substring(pipeIndex + 1),
+    };
+  }
+  return { participantSid: packed, trackSid: '' };
+}
 
 // ─── Room Options ───────────────────────────────────────────────────────────
 
@@ -277,70 +292,64 @@ export class Room extends TypedEmitter<RoomEvents> {
     }
   }
 
-  /** Pending tracks waiting to be matched to a participant publication */
-  private pendingTracks: Array<{ mediaTrack: any; mid: string }> = [];
+  /** Pending tracks waiting for participant/publication info to arrive */
+  private pendingTracks: Array<{ mediaTrack: any; participantSid: string; trackSid: string }> = [];
 
   private handleRemoteTrack(mediaTrack: any, transceiver: any): void {
-    const mid = String(transceiver.mid);
-    const mediaKind = mediaTrack?.kind; // 'audio' or 'video'
+    const mediaKind = mediaTrack?.kind;
     const me = this.localParticipant?.identity ?? '?';
 
     // Only handle audio tracks (video not supported in this SDK)
     if (mediaKind !== 'audio') {
-      log.debug(`[${me}] Skipping ${mediaKind} track (mid=${mid}, audio-only SDK)`);
+      log.debug(`[${me}] Skipping ${mediaKind} track (audio-only SDK)`);
       return;
     }
 
-    log.debug(`[${me}] handleRemoteTrack: mid=${mid}, kind=${mediaKind}`);
+    // SFU packs "participantSid|trackSid" into the msid stream ID
+    // (same as Go SDK's track.StreamID() — see room.go unpackStreamID)
+    const streamId = transceiver.receiver?.remoteStreamId ?? '';
+    const { participantSid, trackSid } = unpackStreamId(streamId);
 
-    if (this.matchTrack(mediaTrack, mid)) return;
+    log.debug(`[${me}] handleRemoteTrack: streamId="${streamId}", participantSid="${participantSid}", trackSid="${trackSid}"`);
 
-    // Not matched yet — queue it (participant update may arrive later)
-    log.debug(`[${me}] Queuing unmatched audio track (mid=${mid})`);
-    this.pendingTracks.push({ mediaTrack, mid });
+    if (!participantSid || !trackSid) {
+      log.warn(`[${me}] Cannot match track: missing IDs in streamId "${streamId}"`);
+      return;
+    }
+
+    if (!this.matchTrackToParticipant(mediaTrack, participantSid, trackSid)) {
+      log.debug(`[${me}] Queuing unmatched track (participantSid=${participantSid}, trackSid=${trackSid})`);
+      this.pendingTracks.push({ mediaTrack, participantSid, trackSid });
+    }
   }
 
   /**
-   * Match a media track to a participant publication.
-   * Strategy:
-   * 1. Try matching by mid (SFU assigns mid in TrackInfo)
-   * 2. Fall back to first unassigned audio publication (for SFUs that don't set mid)
+   * Match a media track to the correct participant and publication using
+   * the SFU-provided participant SID and track SID. No heuristics needed.
    */
-  private matchTrack(mediaTrack: any, mid: string): boolean {
+  private matchTrackToParticipant(mediaTrack: any, participantSid: string, trackSid: string): boolean {
     const me = this.localParticipant?.identity ?? '?';
 
-    // Strategy 1: match by mid
-    for (const participant of this.remoteParticipants.values()) {
-      for (const [sid, pub] of participant.trackPublications) {
-        if (pub.mid === mid && pub.kind === TrackType.AUDIO) {
-          log.debug(`[${me}] Matched mid=${mid} → ${participant.identity}/${pub.name} (by mid)`);
-          if (pub.track) participant.removeTrack(sid);
-          participant.addSubscribedTrack(mediaTrack, sid, pub.name);
-          return true;
-        }
-      }
+    const participant = this.remoteParticipants.get(participantSid);
+    if (!participant) return false;
+
+    const pub = participant.trackPublications.get(trackSid);
+    if (!pub) return false;
+
+    if (pub.track) {
+      participant.removeTrack(trackSid);
     }
 
-    // Strategy 2: match by kind — first unassigned audio publication
-    for (const participant of this.remoteParticipants.values()) {
-      for (const [sid, pub] of participant.trackPublications) {
-        if (!pub.track && pub.kind === TrackType.AUDIO) {
-          log.debug(`[${me}] Matched mid=${mid} → ${participant.identity}/${pub.name} (by kind, unassigned)`);
-          participant.addSubscribedTrack(mediaTrack, sid, pub.name);
-          return true;
-        }
-      }
-    }
-
-    log.debug(`[${me}] No match for mid=${mid} (pubs: ${[...this.remoteParticipants.values()].map(p => `${p.identity}=[${[...p.trackPublications.values()].map(t => `${t.name}:mid=${t.mid}:has=${!!t.track}`).join(',')}]`).join(', ')})`);
-    return false;
+    log.info(`[${me}] Track matched: ${participant.identity}/${pub.name} (trackSid=${trackSid})`);
+    participant.addSubscribedTrack(mediaTrack, trackSid, pub.name);
+    return true;
   }
 
   /** Try to match any pending tracks after participant updates arrive */
   private flushPendingTracks(): void {
     const remaining: typeof this.pendingTracks = [];
     for (const pending of this.pendingTracks) {
-      if (!this.matchTrack(pending.mediaTrack, pending.mid)) {
+      if (!this.matchTrackToParticipant(pending.mediaTrack, pending.participantSid, pending.trackSid)) {
         remaining.push(pending);
       }
     }

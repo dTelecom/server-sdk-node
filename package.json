@@ -1,6 +1,6 @@
 {
   "name": "@dtelecom/server-sdk-node",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Node.js RTC SDK for dTelecom — WebRTC participant for AI bots",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
