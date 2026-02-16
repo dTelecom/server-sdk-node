@@ -263,6 +263,7 @@ export class RemoteParticipant extends TypedEmitter<RemoteParticipantEvents> {
     const activeSids = new Set<string>();
     for (const trackInfo of info.tracks) {
       activeSids.add(trackInfo.sid);
+      log.debug(`Track info for ${this.identity}: sid=${trackInfo.sid}, type=${trackInfo.type}, mid=${trackInfo.mid}`);
       const existing = this._trackPublications.get(trackInfo.sid);
       if (existing) {
         existing.updateInfo(trackInfo);

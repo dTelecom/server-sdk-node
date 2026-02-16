@@ -1,6 +1,6 @@
 {
   "name": "@dtelecom/server-sdk-node",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Node.js RTC SDK for dTelecom — WebRTC participant for AI bots",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,13 +20,14 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit",
-    "format": "prettier --write src"
+    "format": "prettier --write src",
+    "postinstall": "npx patch-package"
   },
   "dependencies": {
     "@discordjs/opus": "^0.9.0",
     "opusscript": "^0.1.1",
     "protobufjs": "^7.5.0",
-    "werift": "^0.19.4",
+    "werift": "0.22.8",
     "ws": "^8.18.0"
   },
   "devDependencies": {

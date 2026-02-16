@@ -1,0 +1,17 @@
+diff --git a/node_modules/werift/lib/ice/src/ice.js b/node_modules/werift/lib/ice/src/ice.js
+index 74cf126..6948a28 100644
+--- a/node_modules/werift/lib/ice/src/ice.js
++++ b/node_modules/werift/lib/ice/src/ice.js
+@@ -288,10 +288,10 @@ class Connection {
+                             }
+                             catch (error) {
+                                 if (nominated.id === this.nominated?.id) {
+-                                    log("no stun response");
++                                    log("no stun response, failure", failures + 1);
+                                     failures++;
+                                     this.setState("disconnected");
+-                                    break;
++                                    // Don't break — RFC 7675 requires CONSENT_FAILURES consecutive failures
+                                 }
+                             }
+                             if (failures >= iceBase_1.CONSENT_FAILURES) {

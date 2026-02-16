@@ -3,6 +3,11 @@
  *
  * Handles binary protobuf signaling: SignalRequest (client→server)
  * and SignalResponse (server→client).
+ *
+ * Keepalive: sends application-level protobuf pings at the interval specified
+ * by the server's JoinResponse (pingInterval / pingTimeout).  This matches
+ * the official client-sdk-js behaviour.  If no pong is received within
+ * pingTimeout seconds the connection is considered dead.
  */
 
 import WebSocket from 'ws';
@@ -63,9 +68,18 @@ export interface SignalEvents {
 
 export class SignalClient extends TypedEmitter<SignalEvents> {
   private ws: WebSocket | null = null;
-  private pingInterval: NodeJS.Timeout | null = null;
   private _isConnected = false;
   private joinResponse: JoinResponse | null = null;
+
+  /** App-level ping interval timer (sends ping every pingInterval seconds). */
+  private pingIntervalTimer: NodeJS.Timeout | null = null;
+  /** App-level pong timeout timer (fires if no pong within pingTimeout seconds). */
+  private pingTimeoutTimer: NodeJS.Timeout | null = null;
+  /** Server-provided ping config (seconds). */
+  private pingIntervalS = 0;
+  private pingTimeoutS = 0;
+  /** RTT measured from last ping/pong round-trip. */
+  private rtt = 0;
 
   get isConnected(): boolean {
     return this._isConnected;
@@ -121,9 +135,12 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
             this.joinResponse = response.join;
             this._isConnected = true;
 
-            // Set up ping if configured
-            if (response.join.pingInterval > 0) {
-              this.startPing(response.join.pingInterval);
+            // Start app-level ping/pong using server-provided config.
+            this.pingTimeoutS = response.join.pingTimeout;
+            this.pingIntervalS = response.join.pingInterval;
+            if (this.pingTimeoutS > 0) {
+              log.debug(`Ping config: interval=${this.pingIntervalS}s, timeout=${this.pingTimeoutS}s`);
+              this.startPingInterval();
             }
 
             resolve(response.join);
@@ -143,7 +160,7 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
       this.ws.on('close', (code, reason) => {
         clearTimeout(timeout);
         this._isConnected = false;
-        this.stopPing();
+        this.stopPingInterval();
         const reasonStr = reason?.toString() || `code ${code}`;
         log.info(`WebSocket closed: ${reasonStr}`);
         this.emit('close', reasonStr);
@@ -197,7 +214,7 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
 
   /** Close the WebSocket connection */
   close(): void {
-    this.stopPing();
+    this.stopPingInterval();
     this._isConnected = false;
     if (this.ws) {
       this.ws.removeAllListeners();
@@ -251,6 +268,12 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
   }
 
   private handleResponse(response: SignalResponse): void {
+    // Log all response types for debugging
+    const types = Object.keys(response).filter(k => (response as any)[k] !== undefined && (response as any)[k] !== null);
+    if (types.length > 0) {
+      log.debug(`Signal response: ${types.join(', ')}`);
+    }
+
     // join is handled in the connect() promise
     if (response.offer) {
       log.debug(`Received OFFER from server (type=${response.offer.type})`);
@@ -296,22 +319,65 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
       // Server-initiated mute — handled via participant update
     }
     if (response.pong !== undefined) {
-      // Pong received — connection alive
+      this.resetPingTimeout();
+    }
+    if (response.pongResp) {
+      this.rtt = Date.now() - response.pongResp.lastPingTimestamp;
+      this.resetPingTimeout();
     }
   }
 
-  private startPing(intervalSec: number): void {
-    this.stopPing();
-    const intervalMs = intervalSec * 1000;
-    this.pingInterval = setInterval(() => {
-      this.sendRequest({ ping: Date.now() });
-    }, intervalMs);
+  /**
+   * Send app-level ping (both legacy and new format, matching client-sdk-js).
+   * Proto: SignalRequest.ping (field 14) + SignalRequest.ping_req (field 16).
+   */
+  private sendPing(): void {
+    const now = Date.now();
+    this.sendRequest({ ping: now });
+    this.sendRequest({ pingReq: { timestamp: now, rtt: this.rtt } });
   }
 
-  private stopPing(): void {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
+  /** Start sending pings at pingIntervalS and watching for pong timeout. */
+  private startPingInterval(): void {
+    this.stopPingInterval();
+    this.resetPingTimeout();
+    if (!this.pingIntervalS) return;
+    this.pingIntervalTimer = setInterval(() => {
+      this.sendPing();
+    }, this.pingIntervalS * 1000);
+  }
+
+  /** Stop ping interval + timeout timers. */
+  private stopPingInterval(): void {
+    if (this.pingIntervalTimer) {
+      clearInterval(this.pingIntervalTimer);
+      this.pingIntervalTimer = null;
     }
+    if (this.pingTimeoutTimer) {
+      clearTimeout(this.pingTimeoutTimer);
+      this.pingTimeoutTimer = null;
+    }
+  }
+
+  /** Reset the pong-timeout timer. Called when we receive a pong. */
+  private resetPingTimeout(): void {
+    if (this.pingTimeoutTimer) {
+      clearTimeout(this.pingTimeoutTimer);
+      this.pingTimeoutTimer = null;
+    }
+    if (!this.pingTimeoutS) return;
+    this.pingTimeoutTimer = setTimeout(() => {
+      this.pingTimeoutTimer = null;
+      if (this._isConnected) {
+        log.warn(`Ping timeout — no pong received within ${this.pingTimeoutS}s`);
+        this._isConnected = false;
+        if (this.ws) {
+          this.ws.removeAllListeners();
+          this.ws.close();
+          this.ws = null;
+        }
+        this.emit('close', 'ping_timeout');
+      }
+    }, this.pingTimeoutS * 1000);
   }
 }

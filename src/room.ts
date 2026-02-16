@@ -86,6 +86,8 @@ export class Room extends TypedEmitter<RoomEvents> {
   private _isConnected = false;
   private activeSpeakers: Array<LocalParticipant | RemoteParticipant> = [];
   private roomInfo: RoomInfo | null = null;
+  /** Identity-prefixed logger for debugging multi-Room scenarios */
+  private log = log;
 
   constructor() {
     super();
@@ -122,7 +124,8 @@ export class Room extends TypedEmitter<RoomEvents> {
     this.setupSignalHandlers();
 
     this._isConnected = true;
-    log.info(`Connected to room "${this.name}" as "${this.localParticipant.identity}"`);
+    this.log = log;
+    log.info(`[${this.localParticipant.identity}] Connected to room "${this.name}"`);
   }
 
   /**
@@ -240,6 +243,7 @@ export class Room extends TypedEmitter<RoomEvents> {
   }
 
   private handleParticipantUpdate(update: ParticipantUpdate): void {
+    const me = this.localParticipant?.identity ?? '?';
     for (const info of update.participants) {
       // Skip local participant (match by SID or identity)
       if (info.sid === this.localParticipant.sid || info.identity === this.localParticipant.identity) {
@@ -253,48 +257,97 @@ export class Room extends TypedEmitter<RoomEvents> {
         if (participant) {
           participant.destroy();
           this.remoteParticipants.delete(info.sid);
-          log.info(`Participant disconnected: ${participant.identity}`);
+          log.info(`[${me}] Participant disconnected: ${participant.identity}`);
           this.emit('participantDisconnected', participant);
         }
       } else {
         // Participant joined or updated
-        const isNew = !this.remoteParticipants.has(info.sid);
-        const participant = this.getOrCreateParticipant(info);
+        const { participant, isNew } = this.getOrCreateParticipant(info);
 
         if (isNew) {
-          log.info(`Participant connected: ${participant.identity}`);
+          log.info(`[${me}] Participant connected: ${participant.identity}`);
           this.emit('participantConnected', participant);
         }
       }
     }
+
+    // Try to match any pending tracks that arrived before participant info
+    if (this.pendingTracks.length > 0) {
+      this.flushPendingTracks();
+    }
   }
 
+  /** Pending tracks waiting to be matched to a participant publication */
+  private pendingTracks: Array<{ mediaTrack: any; mid: string }> = [];
+
   private handleRemoteTrack(mediaTrack: any, transceiver: any): void {
-    const mid = transceiver.mid;
+    const mid = String(transceiver.mid);
     const mediaKind = mediaTrack?.kind; // 'audio' or 'video'
+    const me = this.localParticipant?.identity ?? '?';
 
-    // Map werift track kind to proto TrackType
-    const expectedType = mediaKind === 'audio' ? TrackType.AUDIO : TrackType.VIDEO;
+    // Only handle audio tracks (video not supported in this SDK)
+    if (mediaKind !== 'audio') {
+      log.debug(`[${me}] Skipping ${mediaKind} track (mid=${mid}, audio-only SDK)`);
+      return;
+    }
 
-    // Search participants for an unassigned publication matching the track kind
+    log.debug(`[${me}] handleRemoteTrack: mid=${mid}, kind=${mediaKind}`);
+
+    if (this.matchTrack(mediaTrack, mid)) return;
+
+    // Not matched yet — queue it (participant update may arrive later)
+    log.debug(`[${me}] Queuing unmatched audio track (mid=${mid})`);
+    this.pendingTracks.push({ mediaTrack, mid });
+  }
+
+  /**
+   * Match a media track to a participant publication.
+   * Strategy:
+   * 1. Try matching by mid (SFU assigns mid in TrackInfo)
+   * 2. Fall back to first unassigned audio publication (for SFUs that don't set mid)
+   */
+  private matchTrack(mediaTrack: any, mid: string): boolean {
+    const me = this.localParticipant?.identity ?? '?';
+
+    // Strategy 1: match by mid
     for (const participant of this.remoteParticipants.values()) {
       for (const [sid, pub] of participant.trackPublications) {
-        if (!pub.track && pub.kind === expectedType) {
-          // Only handle audio tracks (video not supported in this SDK)
-          if (mediaKind !== 'audio') {
-            log.debug(`Skipping ${mediaKind} track ${sid} (audio-only SDK)`);
-            return;
-          }
-
-          // addSubscribedTrack emits 'trackSubscribed' on participant,
-          // which bubbles up to Room via the listener in getOrCreateParticipant
+        if (pub.mid === mid && pub.kind === TrackType.AUDIO) {
+          log.debug(`[${me}] Matched mid=${mid} → ${participant.identity}/${pub.name} (by mid)`);
+          if (pub.track) participant.removeTrack(sid);
           participant.addSubscribedTrack(mediaTrack, sid, pub.name);
-          return;
+          return true;
         }
       }
     }
 
-    log.warn(`Received remote track (mid=${mid}, kind=${mediaKind}) but couldn't match to a participant`);
+    // Strategy 2: match by kind — first unassigned audio publication
+    for (const participant of this.remoteParticipants.values()) {
+      for (const [sid, pub] of participant.trackPublications) {
+        if (!pub.track && pub.kind === TrackType.AUDIO) {
+          log.debug(`[${me}] Matched mid=${mid} → ${participant.identity}/${pub.name} (by kind, unassigned)`);
+          participant.addSubscribedTrack(mediaTrack, sid, pub.name);
+          return true;
+        }
+      }
+    }
+
+    log.debug(`[${me}] No match for mid=${mid} (pubs: ${[...this.remoteParticipants.values()].map(p => `${p.identity}=[${[...p.trackPublications.values()].map(t => `${t.name}:mid=${t.mid}:has=${!!t.track}`).join(',')}]`).join(', ')})`);
+    return false;
+  }
+
+  /** Try to match any pending tracks after participant updates arrive */
+  private flushPendingTracks(): void {
+    const remaining: typeof this.pendingTracks = [];
+    for (const pending of this.pendingTracks) {
+      if (!this.matchTrack(pending.mediaTrack, pending.mid)) {
+        remaining.push(pending);
+      }
+    }
+    if (this.pendingTracks.length !== remaining.length) {
+      log.debug(`Matched ${this.pendingTracks.length - remaining.length} pending tracks`);
+    }
+    this.pendingTracks = remaining;
   }
 
   private handleDataMessage(data: Uint8Array, kind: 'reliable' | 'lossy'): void {
@@ -324,28 +377,41 @@ export class Room extends TypedEmitter<RoomEvents> {
     this.emit('activeSpeakersChanged', speakers);
   }
 
-  private getOrCreateParticipant(info: ParticipantInfo): RemoteParticipant {
+  private getOrCreateParticipant(info: ParticipantInfo): { participant: RemoteParticipant; isNew: boolean } {
     let participant = this.remoteParticipants.get(info.sid);
     if (participant) {
       participant.updateInfo(info);
-    } else {
-      participant = new RemoteParticipant(info);
-      this.remoteParticipants.set(info.sid, participant);
-
-      // Wire up participant events to room events
-      participant.on('trackSubscribed', (track, pub) => {
-        this.emit('trackSubscribed', track, pub, participant!);
-      });
-      participant.on('trackUnsubscribed', (track, pub) => {
-        this.emit('trackUnsubscribed', track, pub, participant!);
-      });
-      participant.on('trackPublished', (pub) => {
-        this.emit('trackPublished', pub as RemoteTrackPublication, participant!);
-      });
-      participant.on('trackUnpublished', (pub) => {
-        this.emit('trackUnpublished', pub as RemoteTrackPublication, participant!);
-      });
+      return { participant, isNew: false };
     }
-    return participant;
+
+    // SID not found — check if same identity exists under an old SID
+    for (const [oldSid, existing] of this.remoteParticipants) {
+      if (existing.identity === info.identity) {
+        // Re-index under the new SID
+        this.remoteParticipants.delete(oldSid);
+        existing.updateInfo(info);
+        this.remoteParticipants.set(info.sid, existing);
+        return { participant: existing, isNew: false };
+      }
+    }
+
+    // Truly new participant
+    participant = new RemoteParticipant(info);
+    this.remoteParticipants.set(info.sid, participant);
+
+    // Wire up participant events to room events
+    participant.on('trackSubscribed', (track, pub) => {
+      this.emit('trackSubscribed', track, pub, participant!);
+    });
+    participant.on('trackUnsubscribed', (track, pub) => {
+      this.emit('trackUnsubscribed', track, pub, participant!);
+    });
+    participant.on('trackPublished', (pub) => {
+      this.emit('trackPublished', pub as RemoteTrackPublication, participant!);
+    });
+    participant.on('trackUnpublished', (pub) => {
+      this.emit('trackUnpublished', pub as RemoteTrackPublication, participant!);
+    });
+    return { participant, isNew: true };
   }
 }

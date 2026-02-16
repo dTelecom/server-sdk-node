@@ -110,7 +110,49 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
       await this.negotiate();
     }
 
+    // Wait for the primary PeerConnection to reach ICE connected, matching
+    // the Go SDK's waitUntilConnected() (engine.go:155).  The SFU always
+    // sends a subscriber offer (even with canSubscribe=false) to establish
+    // data channels.  Without a connected PC the SFU will eventually stop
+    // routing participant updates (~40 s timeout).
+    await this.waitForPrimaryConnected();
+
     return joinResponse;
+  }
+
+  /**
+   * Wait for the primary PeerConnection ICE to reach "connected".
+   * When subscriberPrimary=true the subscriber PC is primary;
+   * otherwise the publisher PC is primary.
+   */
+  private waitForPrimaryConnected(timeoutMs = 15000): Promise<void> {
+    const pc = this.subscriberPrimary ? this.subscriber : this.publisher;
+    if (!pc) return Promise.resolve();
+
+    const iceState = pc.iceConnectionState;
+    if (iceState === 'connected' || iceState === 'completed') {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(
+          `Primary PC ICE timed out after ${timeoutMs}ms (state: ${pc.iceConnectionState})`,
+        ));
+      }, timeoutMs);
+
+      const handler = (state: string) => {
+        if (state === 'connected' || state === 'completed') {
+          clearTimeout(timeout);
+          resolve();
+        } else if (state === 'failed') {
+          clearTimeout(timeout);
+          reject(new Error('Primary PC ICE failed'));
+        }
+      };
+
+      pc.iceConnectionStateChange.subscribe(handler);
+    });
   }
 
   async addTransceiver(track: MediaStreamTrack): Promise<RTCRtpTransceiver> {
@@ -388,6 +430,10 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
           new RTCSessionDescription(sd.sdp, sd.type as 'offer'),
         );
 
+        // Flush pending ICE candidates for subscriber (they arrive while
+        // setRemoteDescription is awaited — see Go SDK transport.go:188-194).
+        this.flushPendingCandidates(SignalTarget.SUBSCRIBER);
+
         const answer = await this.subscriber.createAnswer();
         await this.subscriber.setLocalDescription(answer);
 
@@ -454,10 +500,8 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     });
 
     this.signal.on('close', (reason) => {
-      if (this._isConnected) {
-        this._isConnected = false;
-        this.emit('disconnected', reason);
-      }
+      this._isConnected = false;
+      this.emit('disconnected', reason);
     });
   }
 

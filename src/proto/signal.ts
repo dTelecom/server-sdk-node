@@ -63,6 +63,7 @@ export interface SignalRequest {
   syncState?: SyncState;
   simulate?: SimulateScenario;
   ping?: number;
+  pingReq?: { timestamp: number; rtt: number };
 }
 
 // ─── Signal Response (server → client) ──────────────────────────────────────
@@ -85,6 +86,7 @@ export interface SignalResponse {
   refreshToken?: string;
   trackUnpublished?: TrackUnpublishedResponse;
   pong?: number;
+  pongResp?: { lastPingTimestamp: number; timestamp: number };
 }
 
 // ─── Sub-messages ───────────────────────────────────────────────────────────
@@ -827,7 +829,14 @@ export const SignalRequest = {
       writeMessage(writer, 8, (w) => LeaveRequest.encode(message.leave!, w));
     }
     if (message.ping !== undefined) {
-      writer.uint32(72).int64(message.ping);
+      writer.uint32(112).int64(message.ping);
+    }
+    if (message.pingReq !== undefined) {
+      // field 16, wire type 2 (length-delimited): tag = (16 << 3) | 2 = 130
+      const nested = writer.uint32(130).fork();
+      nested.uint32(8).int64(message.pingReq.timestamp);   // field 1
+      nested.uint32(16).int64(message.pingReq.rtt);         // field 2
+      nested.ldelim();
     }
     return writer;
   },
@@ -858,6 +867,21 @@ export const SignalResponse = {
         case 15: message.refreshToken = reader.string(); break;
         case 17: message.trackUnpublished = TrackUnpublishedResponse.decode(reader, reader.uint32()); break;
         case 18: message.pong = reader.int64() as unknown as number; break;
+        case 20: {
+          // pongResp: Pong message (field 20, length-delimited)
+          const pongEnd = reader.pos + reader.uint32();
+          const pongResp: { lastPingTimestamp: number; timestamp: number } = { lastPingTimestamp: 0, timestamp: 0 };
+          while (reader.pos < pongEnd) {
+            const pongTag = reader.uint32();
+            switch (pongTag >>> 3) {
+              case 1: pongResp.lastPingTimestamp = reader.int64() as unknown as number; break;
+              case 2: pongResp.timestamp = reader.int64() as unknown as number; break;
+              default: reader.skipType(pongTag & 7); break;
+            }
+          }
+          message.pongResp = pongResp;
+          break;
+        }
         default: reader.skipType(tag & 7); break;
       }
     }

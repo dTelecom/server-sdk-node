@@ -29,6 +29,8 @@ export class TrackPublication extends TypedEmitter<TrackPublicationEvents> {
   source: TrackSource;
   mimeType: string;
   muted: boolean;
+  /** Media ID assigned by SFU — used to match WebRTC transceivers to publications */
+  mid: string;
 
   constructor(info: TrackInfo) {
     super();
@@ -38,6 +40,7 @@ export class TrackPublication extends TypedEmitter<TrackPublicationEvents> {
     this.source = info.source;
     this.mimeType = info.mimeType;
     this.muted = info.muted;
+    this.mid = info.mid;
   }
 
   updateInfo(info: TrackInfo): void {
@@ -48,6 +51,7 @@ export class TrackPublication extends TypedEmitter<TrackPublicationEvents> {
     this.source = info.source;
     this.mimeType = info.mimeType;
     this.muted = info.muted;
+    this.mid = info.mid;
 
     if (wasMuted !== info.muted) {
       this.emit(info.muted ? 'muted' : 'unmuted');
