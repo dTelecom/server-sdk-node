@@ -29,6 +29,9 @@ export class AudioSource {
   // Callback set by LocalAudioTrack to receive encoded Opus frames
   private _onEncodedFrame: ((opusData: Buffer) => void) | null = null;
 
+  // Ready callback — fired once when DTLS is connected and RTP can be sent
+  private _onReady: (() => void) | null = null;
+
   /**
    * @param sampleRate Input sample rate (e.g. 16000 for STT/TTS)
    * @param channels Number of channels (1 = mono)
@@ -44,6 +47,28 @@ export class AudioSource {
   /** Set the callback for encoded Opus frames. Used internally by LocalAudioTrack. */
   set onEncodedFrame(cb: ((opusData: Buffer) => void) | null) {
     this._onEncodedFrame = cb;
+    // Notify that transport is ready to send
+    if (cb && this._onReady) {
+      this._onReady();
+      this._onReady = null;
+    }
+  }
+
+  /** True when the RTP transport is connected and frames will be sent (not dropped). */
+  get ready(): boolean {
+    return this._onEncodedFrame !== null;
+  }
+
+  /**
+   * Register a one-shot callback fired when the transport becomes ready.
+   * If already ready, the callback is invoked immediately.
+   */
+  set onReady(cb: (() => void) | null) {
+    if (cb && this._onEncodedFrame) {
+      cb();
+      return;
+    }
+    this._onReady = cb;
   }
 
   /** Associate this source with a werift MediaStreamTrack */
