@@ -2,16 +2,14 @@
  * AudioSource — feeds PCM16 audio into a local audio track.
  *
  * Handles:
- * - Resampling from user's sample rate (e.g. 16kHz) to Opus rate (48kHz)
- * - Opus encoding
+ * - Opus encoding (at input sample rate — libopus handles internal resampling)
  * - Frame buffering to ensure exact 20ms frame boundaries
  * - RTP packetization
  */
 
 import { MediaStreamTrack } from 'werift';
 import { AudioFrame } from './audio-frame';
-import { OpusEncoder, OPUS_SAMPLE_RATE, OPUS_FRAME_SIZE } from './opus-encoder';
-import { upsample } from './resampler';
+import { OpusEncoder } from './opus-encoder';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('AudioSource');
@@ -23,10 +21,10 @@ export class AudioSource {
   private encoder: OpusEncoder | null = null;
   private track: MediaStreamTrack | null = null;
 
-  // Buffer for accumulating samples to form exact 20ms frames at 48kHz
+  // Buffer for accumulating samples to form exact 20ms frames
   private sampleBuffer: Int16Array;
   private bufferOffset: number = 0;
-  private readonly frameSizeAt48k: number;
+  private readonly frameSize: number;
 
   // Callback set by LocalAudioTrack to receive encoded Opus frames
   private _onEncodedFrame: ((opusData: Buffer) => void) | null = null;
@@ -38,8 +36,9 @@ export class AudioSource {
   constructor(sampleRate: number, channels: number = 1) {
     this.sampleRate = sampleRate;
     this.channels = channels;
-    this.frameSizeAt48k = OPUS_FRAME_SIZE * channels; // 960 for mono
-    this.sampleBuffer = new Int16Array(this.frameSizeAt48k);
+    // 20ms frame size at input sample rate (e.g. 320 for 16kHz, 960 for 48kHz)
+    this.frameSize = (sampleRate * 20 / 1000) * channels;
+    this.sampleBuffer = new Int16Array(this.frameSize);
   }
 
   /** Set the callback for encoded Opus frames. Used internally by LocalAudioTrack. */
@@ -55,25 +54,21 @@ export class AudioSource {
   /**
    * Feed a PCM16 audio frame into the source.
    *
-   * The frame is resampled to 48kHz, buffered to 20ms boundaries,
-   * Opus-encoded, and sent to the track for RTP transmission.
+   * Buffered to 20ms boundaries, Opus-encoded at input sample rate,
+   * and sent to the track for RTP transmission.
    */
   async captureFrame(frame: AudioFrame): Promise<void> {
-    // Lazy-init encoder
+    // Lazy-init encoder at input sample rate — libopus handles resampling internally
     if (!this.encoder) {
-      this.encoder = new OpusEncoder(OPUS_SAMPLE_RATE, this.channels);
+      this.encoder = new OpusEncoder(this.sampleRate, this.channels);
     }
 
-    // Resample to 48kHz if needed
-    let samples = frame.data;
-    if (frame.sampleRate !== OPUS_SAMPLE_RATE) {
-      samples = upsample(frame.data, frame.sampleRate, OPUS_SAMPLE_RATE, this.channels);
-    }
+    const samples = frame.data;
 
     // Buffer samples and encode in 20ms chunks
     let offset = 0;
     while (offset < samples.length) {
-      const remaining = this.frameSizeAt48k - this.bufferOffset;
+      const remaining = this.frameSize - this.bufferOffset;
       const available = samples.length - offset;
       const toCopy = Math.min(remaining, available);
 
@@ -82,7 +77,7 @@ export class AudioSource {
       offset += toCopy;
 
       // Full 20ms frame? Encode and send
-      if (this.bufferOffset >= this.frameSizeAt48k) {
+      if (this.bufferOffset >= this.frameSize) {
         this.encodeAndSend(this.sampleBuffer);
         this.bufferOffset = 0;
       }
