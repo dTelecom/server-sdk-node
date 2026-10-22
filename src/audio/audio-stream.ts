@@ -13,21 +13,33 @@ import { MediaStreamTrack, RtpPacket } from 'werift';
 import { AudioFrame } from './audio-frame';
 import { OpusDecoder } from './opus-decoder';
 import { OPUS_SAMPLE_RATE, OPUS_FRAME_SIZE } from './opus-encoder';
-import { OpusRtpDepacketizer } from './rtp-opus';
 import { downsample } from './resampler';
 import { AsyncQueue } from '../utils/queue';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('AudioStream');
 
+// Normal packets are emitted immediately. Only absent packets use this grace
+// period, so ordinary speech does not acquire a jitter-buffer delay.
+const SILENCE_GRACE_MS = 60;
+const MAX_TIMESTAMP_GAP_SAMPLES = OPUS_SAMPLE_RATE * 3;
+
 export class AudioStream implements AsyncIterable<AudioFrame> {
   private decoder: OpusDecoder | null = null;
-  private depacketizer: OpusRtpDepacketizer;
   private queue: AsyncQueue<AudioFrame>;
   private readonly outputSampleRate: number;
   private readonly outputChannels: number;
   private track: MediaStreamTrack | null = null;
   private _closed = false;
+  private silenceTimer: ReturnType<typeof setInterval> | null = null;
+  private lastSequence: number | null = null;
+  private lastTimestamp: number | null = null;
+  private lastFrameSamples = 0;
+  private lastPacketAt = 0;
+  private concealedSamples = 0;
+  private currentSsrc: number | null = null;
+  private timestampSilenceSamples = 0;
+  private stalledSilenceSamples = 0;
 
   /**
    * @param track The remote audio track to stream from
@@ -37,7 +49,6 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
   constructor(track: MediaStreamTrack, sampleRate: number = 16000, channels: number = 1) {
     this.outputSampleRate = sampleRate;
     this.outputChannels = channels;
-    this.depacketizer = new OpusRtpDepacketizer();
     this.queue = new AsyncQueue<AudioFrame>();
     this.track = track;
     this.start();
@@ -51,6 +62,8 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
   close(): void {
     if (this._closed) return;
     this._closed = true;
+    if (this.silenceTimer) clearInterval(this.silenceTimer);
+    this.silenceTimer = null;
     this.queue.close();
 
     if (this.decoder) {
@@ -59,7 +72,7 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
     }
 
     this.track = null;
-    log.debug('AudioStream closed');
+    log.info(`AudioStream closed: packets=${this.packetCount}, timestamp_silence_ms=${Math.round(this.timestampSilenceSamples / 48)}, stalled_silence_ms=${Math.round(this.stalledSilenceSamples / 48)}`);
   }
 
   [Symbol.asyncIterator](): AsyncIterator<AudioFrame> {
@@ -118,36 +131,80 @@ export class AudioStream implements AsyncIterable<AudioFrame> {
       return;
     }
 
+    // A new source has an independent sequence/timestamp space and codec state.
+    if (this.currentSsrc !== rtp.header.ssrc) {
+      this.currentSsrc = rtp.header.ssrc;
+      this.lastSequence = this.lastTimestamp = null;
+      this.concealedSamples = 0;
+      this.decoder?.destroy();
+      this.decoder = null;
+    }
+
+    if (this.lastSequence !== null) {
+      const delta = (rtp.header.sequenceNumber - this.lastSequence) & 0xffff;
+      // Do not decode duplicates or late reordered packets into current audio.
+      if (delta === 0 || delta >= 0x8000) return;
+    }
+
     // Lazy init decoder
     if (!this.decoder) {
       this.decoder = new OpusDecoder(OPUS_SAMPLE_RATE, this.outputChannels);
     }
 
-    const { opusFrame, lost } = this.depacketizer.processPacket(
-      payloadCopy,
-      rtp.header.sequenceNumber,
-      rtp.header.timestamp,
-    );
-
-    // Handle packet loss — generate silence frames (PLC via null can segfault native addon)
-    for (let i = 0; i < lost && i < 3; i++) {
-      const silence = Buffer.alloc(OPUS_FRAME_SIZE * this.outputChannels * 2);
-      this.emitFrame(silence);
-    }
-
-    // Decode the Opus frame
-    if (opusFrame.length < 1) {
-      return;
-    }
-
     try {
       // Defensive copy — werift may reuse internal UDP buffers
-      const opusCopy = Buffer.alloc(opusFrame.length);
-      opusFrame.copy(opusCopy);
+      const opusCopy = Buffer.from(payloadCopy);
       const pcmBuffer = this.decoder.decode(opusCopy);
+
+      if (this.lastTimestamp !== null) {
+        // RTP timestamps advance during DTX even though sequence numbers do not
+        // skip. Subtract silence already emitted by the stall timer exactly once.
+        const timestampDelta = (rtp.header.timestamp - this.lastTimestamp) | 0;
+        const missing = timestampDelta - this.lastFrameSamples - this.concealedSamples;
+        if (missing > 0 && missing <= MAX_TIMESTAMP_GAP_SAMPLES) {
+          this.emitSilence(missing);
+          this.timestampSilenceSamples += missing;
+        } else if (missing > MAX_TIMESTAMP_GAP_SAMPLES || timestampDelta < 0) {
+          log.warn('Audio RTP timestamp discontinuity; rebasing receive timeline');
+        }
+      }
+
+      // Preserve all samples of an accepted speech packet even if network delay
+      // made the stall timer advance further than its RTP timestamp.
       this.emitFrame(pcmBuffer);
+      this.lastSequence = rtp.header.sequenceNumber;
+      this.lastTimestamp = rtp.header.timestamp;
+      this.lastFrameSamples = pcmBuffer.length / (2 * this.outputChannels);
+      this.lastPacketAt = performance.now();
+      this.concealedSamples = 0;
+      if (!this.silenceTimer) {
+        this.silenceTimer = setInterval(() => this.fillStalledInput(), 20);
+        this.silenceTimer.unref();
+      }
     } catch (err) {
-      log.error(`Opus decode failed (${opusFrame.length} bytes)`, err);
+      log.error(`Opus decode failed (${payloadCopy.length} bytes)`, err);
+    }
+  }
+
+  private fillStalledInput(): void {
+    if (this._closed || this.lastTimestamp === null) return;
+    const elapsedSamples = Math.floor((performance.now() - this.lastPacketAt - SILENCE_GRACE_MS) * OPUS_SAMPLE_RATE / 1000);
+    const missing = elapsedSamples - this.lastFrameSamples - this.concealedSamples;
+    // Bound catch-up work after event-loop stalls; never allocate a huge buffer.
+    const samples = Math.min(OPUS_FRAME_SIZE * 5, Math.floor(missing / OPUS_FRAME_SIZE) * OPUS_FRAME_SIZE);
+    if (samples > 0) {
+      this.emitSilence(samples);
+      this.concealedSamples += samples;
+      this.stalledSilenceSamples += samples;
+    }
+  }
+
+  private emitSilence(samples: number): void {
+    while (samples > 0) {
+      const count = Math.min(samples, OPUS_FRAME_SIZE);
+      // Null-packet PLC can segfault the native codec; explicit zeros are safe.
+      this.emitFrame(Buffer.alloc(count * this.outputChannels * 2));
+      samples -= count;
     }
   }
 
