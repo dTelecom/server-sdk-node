@@ -66,7 +66,7 @@ await room.connect(url, token, { autoSubscribe: true });
 room.on('participantConnected', (participant) => { });
 room.on('trackSubscribed', (track, publication, participant) => { });
 room.on('dataReceived', (data, participant, kind, topic) => { });
-room.on('disconnected', (reason) => { });
+room.on('disconnected', (reason) => { }); // client_initiated, or the node's: participant_removed, duplicate_identity, room_deleted, ...
 
 await room.disconnect();
 ```

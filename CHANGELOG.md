@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 (2026-11-16)
+
+- `disconnected` reports why the node ended the session: `participant_removed` (`RoomService.RemoveParticipant`, which dTelecom Cloud uses a minute after an unextended token expires), `duplicate_identity`, `room_deleted`, `server_shutdown`; `server_initiated` when the node gives no reason. Before, a leave from the node was reported as `client_initiated`. Leaving with `room.disconnect()` is still `client_initiated`.
+
 ## 0.3.0 (2026-11-16)
 
 Breaking: requires Node.js 22 or later (werift 0.27 does).

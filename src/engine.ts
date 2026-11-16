@@ -24,9 +24,15 @@ import {
   TrackPublishedResponse,
   AddTrackRequest,
 } from './proto/signal';
-import { TrackType, TrackSource, ICEServer } from './proto/models';
+import { TrackType, TrackSource, ICEServer, DisconnectReason } from './proto/models';
 
 const log = createLogger('RTCEngine');
+
+/** The node's DisconnectReason as `disconnected` reports it, e.g. `participant_removed`. */
+export function leaveReason(reason: DisconnectReason | undefined): string {
+  const name = reason === undefined ? undefined : DisconnectReason[reason];
+  return name && reason !== DisconnectReason.UNKNOWN_REASON ? name.toLowerCase() : 'server_initiated';
+}
 
 /**
  * Parses a candidate trickled by the node. The node (pion) sends `sdpMid: ""` with
@@ -313,7 +319,11 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     channel.send(Buffer.from(data));
   }
 
-  async disconnect(): Promise<void> {
+  /**
+   * Leaves the room and closes the connections. `reason` is what `disconnected` reports:
+   * `client_initiated` when the app leaves, the node's reason when the node ends the session.
+   */
+  async disconnect(reason = 'client_initiated'): Promise<void> {
     this._isConnected = false;
 
     try {
@@ -336,8 +346,8 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     this.subscriberLossyChannel = null;
     this.publishWaiters.clear();
 
-    log.info('Disconnected');
-    this.emit('disconnected', 'client_initiated');
+    log.info(`Disconnected: ${reason}`);
+    this.emit('disconnected', reason);
   }
 
   // ─── Private ────────────────────────────────────────────────────────────
@@ -559,8 +569,10 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
       this.emit('trackPublished', response);
     });
 
-    this.signal.on('leave', () => {
-      this.disconnect();
+    // The node ends the session, e.g. RoomService.RemoveParticipant (participant_removed), a
+    // second join with the same identity (duplicate_identity) or a deleted room (room_deleted).
+    this.signal.on('leave', (request) => {
+      this.disconnect(leaveReason(request?.reason));
     });
 
     this.signal.on('close', (reason) => {
