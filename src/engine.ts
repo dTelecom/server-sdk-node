@@ -62,6 +62,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
 
   private publishWaiters: Map<string, (response: TrackPublishedResponse) => void> = new Map();
   private _negotiateResolve: (() => void) | null = null;
+  /** Negotiations run one at a time: there is one slot for the pending answer. */
+  private negotiateChain: Promise<void> = Promise.resolve();
+  /** The publisher has an applied answer, so its data channels can open. */
+  private publisherNegotiated = false;
+  /** A negotiation started only to open the data channels, shared by concurrent senders. */
+  private dataNegotiation: Promise<void> | null = null;
   private _publisherConnectedResolve: (() => void) | null = null;
 
   get isConnected(): boolean {
@@ -189,7 +195,14 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     });
   }
 
-  async negotiate(): Promise<void> {
+  /** Offers the publisher's current tracks and data channels; one negotiation at a time. */
+  negotiate(): Promise<void> {
+    const run = this.negotiateChain.then(() => this.runNegotiate());
+    this.negotiateChain = run.catch(() => {});
+    return run;
+  }
+
+  private async runNegotiate(): Promise<void> {
     if (!this.publisher) {
       throw new Error('Publisher PC not initialized');
     }
@@ -240,11 +253,51 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     });
   }
 
+  /**
+   * Opens a publisher data channel before the first message. With subscriber-primary joins the
+   * publisher connection is only negotiated when something is published, so a bot that has not
+   * published a track negotiates it here (the offer carries the data channels). Throws when the
+   * channel does not open in time.
+   */
+  async ensureDataChannelOpen(kind: 'reliable' | 'lossy', timeoutMs: number = 15000): Promise<void> {
+    const channel = kind === 'reliable' ? this.reliableChannel : this.lossyChannel;
+    if (!channel) throw new Error('Not connected');
+    if (channel.readyState === 'open') return;
+    if (channel.readyState === 'closing' || channel.readyState === 'closed') {
+      throw new Error(`Data channel ${kind} is closed`);
+    }
+    if (!this.publisherNegotiated) {
+      if (!this.dataNegotiation) {
+        log.debug('Negotiating the publisher to open its data channels');
+        this.dataNegotiation = this.negotiate().finally(() => {
+          this.dataNegotiation = null;
+        });
+      }
+      await this.dataNegotiation;
+    }
+    // The state changes across the await above.
+    if ((channel.readyState as string) === 'open') return;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        subscription.unSubscribe();
+        reject(new Error(`Data channel ${kind} did not open within ${timeoutMs}ms`));
+      }, timeoutMs);
+      const subscription = channel.stateChanged.subscribe((state) => {
+        if (state === 'open' || state === 'closed') {
+          clearTimeout(timer);
+          subscription.unSubscribe();
+          if (state === 'open') resolve();
+          else reject(new Error(`Data channel ${kind} is closed`));
+        }
+      });
+    });
+  }
+
+  /** Sends on an open publisher data channel; throws when it is not open. */
   sendData(data: Uint8Array, kind: 'reliable' | 'lossy'): void {
     const channel = kind === 'reliable' ? this.reliableChannel : this.lossyChannel;
     if (!channel || channel.readyState !== 'open') {
-      log.warn(`Data channel ${kind} not open`);
-      return;
+      throw new Error(`Data channel ${kind} not open`);
     }
     channel.send(Buffer.from(data));
   }
@@ -457,6 +510,7 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
         log.debug('Set publisher remote description');
 
         this.flushPendingCandidates(SignalTarget.PUBLISHER);
+        this.publisherNegotiated = true;
 
         // Resolve negotiate() promise
         if (this._negotiateResolve) {

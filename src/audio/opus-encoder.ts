@@ -1,5 +1,6 @@
 /**
- * Opus encoder wrapper around @discordjs/opus.
+ * Opus encoder: @discordjs/opus (native libopus) when it is installed, else opusscript (WASM).
+ * @discordjs/opus is an optional dependency, so a failed native build does not fail the install.
  *
  * Encodes PCM16 audio into Opus frames. Supports any Opus-valid sample rate
  * (8000, 12000, 16000, 24000, 48000) — libopus handles internal resampling.
@@ -77,17 +78,19 @@ export class OpusEncoder {
     // produces tiny frames instead of full-rate encoded zeros, eliminating
     // artifacts at speech↔silence boundaries. The decoder generates comfort
     // noise automatically. OPUS_SET_DTX_REQUEST = 4016.
-    if (typeof this.encoder.applyEncoderCTL === 'function') {
+    // @discordjs/opus names it applyEncoderCTL, opusscript encoderCTL.
+    const ctl = typeof this.encoder.applyEncoderCTL === 'function' ? 'applyEncoderCTL'
+      : typeof this.encoder.encoderCTL === 'function' ? 'encoderCTL' : null;
+    let dtx = false;
+    if (ctl) {
       try {
-        this.encoder.applyEncoderCTL(4016, 1);
-        log.info(`Opus encoder: ${opusLibraryName}, ${sampleRate}Hz, ${channels}ch, ${bitrate / 1000}kbps, frameSize=${this.frameSize}, DTX=on`);
+        this.encoder[ctl](4016, 1);
+        dtx = true;
       } catch (err) {
         log.warn('Failed to enable DTX:', err);
-        log.info(`Opus encoder: ${opusLibraryName}, ${sampleRate}Hz, ${channels}ch, ${bitrate / 1000}kbps, frameSize=${this.frameSize}`);
       }
-    } else {
-      log.info(`Opus encoder: ${opusLibraryName}, ${sampleRate}Hz, ${channels}ch, ${bitrate / 1000}kbps, frameSize=${this.frameSize}`);
     }
+    log.info(`Opus encoder: ${opusLibraryName}, ${sampleRate}Hz, ${channels}ch, ${bitrate / 1000}kbps, frameSize=${this.frameSize}${dtx ? ', DTX=on' : ''}`);
   }
 
   /**

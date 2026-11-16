@@ -18,6 +18,7 @@ import {
 import {
   ParticipantInfo,
   ParticipantInfo_State,
+  ParticipantPermission,
   TrackInfo,
   TrackType,
   TrackSource,
@@ -45,6 +46,8 @@ export abstract class Participant extends TypedEmitter<ParticipantEvents> {
   name: string;
   metadata: string;
   state: ParticipantInfo_State;
+  /** What the participant's token allows, as the node reports it. */
+  permissions?: ParticipantPermission;
 
   protected _trackPublications = new Map<string, TrackPublication>();
 
@@ -69,6 +72,7 @@ export abstract class Participant extends TypedEmitter<ParticipantEvents> {
     this.name = info.name;
     this.metadata = info.metadata;
     this.state = info.state;
+    if (info.permission) this.permissions = info.permission;
 
     if (metadataChanged) {
       this.emit('metadataChanged', info.metadata);
@@ -85,6 +89,8 @@ export interface DataPublishOptions {
   destinationSids?: string[];
   /** Topic for the data message */
   topic?: string;
+  /** How long to wait for the data channel to open on first use (default 15 s). */
+  timeoutMs?: number;
 }
 
 export class LocalParticipant extends Participant {
@@ -182,10 +188,16 @@ export class LocalParticipant extends Participant {
   /**
    * Publish data to the room.
    *
+   * Works before any track is published: the first call opens the data channel. Rejects when the
+   * participant may not publish data, or the channel does not open within `timeoutMs`.
+   *
    * @param data The data payload
-   * @param options Delivery options (kind, destinations, topic)
+   * @param options Delivery options (kind, destinations, topic, timeoutMs)
    */
   async publishData(data: Uint8Array, options: DataPublishOptions = {}): Promise<void> {
+    if (this.permissions && !this.permissions.canPublishData) {
+      throw new Error('Participant lacks canPublishData');
+    }
     const kind = options.kind ?? DataPacket_Kind.RELIABLE;
     const destinationSids = options.destinationSids ?? [];
     const topic = options.topic;
@@ -202,6 +214,7 @@ export class LocalParticipant extends Participant {
 
     const encoded = DataPacket.encode(packet).finish();
     const channelKind = kind === DataPacket_Kind.RELIABLE ? 'reliable' : 'lossy';
+    await this.engine.ensureDataChannelOpen(channelKind, options.timeoutMs);
     this.engine.sendData(new Uint8Array(encoded), channelKind);
   }
 }

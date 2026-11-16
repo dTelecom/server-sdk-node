@@ -195,6 +195,7 @@ export class Room extends TypedEmitter<RoomEvents> {
         join.participant.name,
         join.participant.metadata,
       );
+      this.localParticipant.permissions = join.participant.permission;
     }
 
     // Other participants

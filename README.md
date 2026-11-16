@@ -9,13 +9,15 @@ Node.js RTC SDK for dTelecom — join rooms as a WebRTC participant for AI bots.
 - **Audio send** — publish PCM16 audio as Opus (from TTS or any source)
 - **Data channels** — send/receive messages via reliable or lossy channels
 - **Pure TypeScript WebRTC** — uses [werift](https://github.com/nicejs/werift-webrtc) (no native WebRTC deps)
-- **Opus codec** — uses [@discordjs/opus](https://github.com/discordjs/opus) (native libopus bindings)
+- **Opus codec** — [@discordjs/opus](https://github.com/discordjs/opus) (native libopus) when it builds on your platform, else [opusscript](https://github.com/abalabahaha/opusscript) (WASM)
 
 ## Install
 
 ```bash
-npm install @dtelecom/server-sdk-node @discordjs/opus
+npm install @dtelecom/server-sdk-node
 ```
+
+`@discordjs/opus` is an optional dependency: npm tries to build it and carries on if it cannot (no compiler, unsupported platform). Without it the SDK encodes with opusscript, which needs more CPU per bot.
 
 ## Quick Start: Echo Bot
 
@@ -132,7 +134,8 @@ npx tsx examples/send-audio.ts --room test --input hello.pcm
 | Package | Purpose | Native? |
 |---|---|---|
 | `werift` | WebRTC (ICE, DTLS, SRTP) | No (pure TS) |
-| `@discordjs/opus` | Opus encode/decode | Yes (libopus) |
+| `@discordjs/opus` (optional) | Opus encode, when it builds | Yes (libopus) |
+| `opusscript` | Opus decode, and encode without `@discordjs/opus` | No (WASM) |
 | `ws` | WebSocket client | No |
 | `protobufjs` | Protobuf encode/decode | No |
 
