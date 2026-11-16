@@ -4,10 +4,7 @@
  * @discordjs/opus v0.9.0 segfaults when decoding SILK or hybrid mode
  * Opus frames (TOC configs < 16). WebRTC browsers switch to these modes
  * when bitrate estimation drops below ~52kbps. opusscript (WASM) handles
- * all Opus modes correctly and cannot segfault.
- *
- * @discordjs/opus is still used for encoding (CELT-only at 64kbps) where
- * it works reliably.
+ * all Opus modes correctly and cannot segfault. The encoder uses opusscript too.
  */
 
 import { createLogger } from '../utils/logger';
