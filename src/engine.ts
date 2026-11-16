@@ -28,6 +28,17 @@ import { TrackType, TrackSource, ICEServer } from './proto/models';
 
 const log = createLogger('RTCEngine');
 
+/**
+ * Parses a candidate trickled by the node. The node (pion) sends `sdpMid: ""` with
+ * `sdpMLineIndex`; browsers treat an empty mid as absent, while werift (since 0.25) looks it up
+ * and rejects the candidate. Dropping it makes werift use the line index.
+ */
+export function parseTrickleCandidate(candidateInit: string): RTCIceCandidate {
+  const init = JSON.parse(candidateInit);
+  if (init.sdpMid === '') delete init.sdpMid;
+  return new RTCIceCandidate(init);
+}
+
 export interface EngineEvents {
   [key: string]: (...args: any[]) => void;
   connected: () => void;
@@ -524,8 +535,7 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
 
     this.signal.on('trickle', async (trickle) => {
       try {
-        const candidateInit = JSON.parse(trickle.candidateInit);
-        const candidate = new RTCIceCandidate(candidateInit);
+        const candidate = parseTrickleCandidate(trickle.candidateInit);
         const pc = trickle.target === SignalTarget.PUBLISHER ? this.publisher : this.subscriber;
 
         if (!pc) return;
