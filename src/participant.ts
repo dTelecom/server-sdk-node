@@ -116,6 +116,11 @@ export class LocalParticipant extends Participant {
     const source = options?.source ?? TrackSource.MICROPHONE;
     const disableDtx = options?.disableDtx ?? false;
 
+    // The node drops a publish request it does not permit without answering: fail at once.
+    if (this.permissions && !this.permissions.canPublish) {
+      throw new Error('Participant lacks canPublish');
+    }
+
     log.info(`Publishing track "${name}" (cid=${track.cid})`);
 
     // Step 1: Request track publication from server
