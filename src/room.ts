@@ -123,6 +123,13 @@ export class Room extends TypedEmitter<RoomEvents> {
   async connect(url: string, token: string, options: RoomOptions = {}): Promise<void> {
     log.info('Connecting to room...');
 
+    // Listen before connecting: engine.connect() waits for ICE after the join, and the SFU sends
+    // the existing participants' tracks and participant updates during that wait. A listener
+    // added afterwards misses them, so a bot that joins after someone published never hears them.
+    // Updates that arrive before the join response is applied are queued and replayed below.
+    this.setupEngineHandlers();
+    this.setupSignalHandlers();
+
     // Connect via engine (signal + WebRTC)
     const joinResponse = await this.engine.connect(url, token, {
       autoSubscribe: options.autoSubscribe ?? true,
@@ -132,11 +139,14 @@ export class Room extends TypedEmitter<RoomEvents> {
     // Initialize room state from JoinResponse
     this.handleJoinResponse(joinResponse);
 
-    // Set up engine event handlers
-    this.setupEngineHandlers();
-
-    // Set up signal event handlers (for participant updates)
-    this.setupSignalHandlers();
+    // Apply what arrived during the connect, in order, then match tracks queued before their
+    // participant was known.
+    const early = this.earlyParticipantUpdates;
+    this.earlyParticipantUpdates = null;
+    for (const update of early ?? []) {
+      this.handleParticipantUpdate(update);
+    }
+    this.flushPendingTracks();
 
     this._isConnected = true;
     this.log = log;
@@ -230,13 +240,20 @@ export class Room extends TypedEmitter<RoomEvents> {
   }
 
   private setupSignalHandlers(): void {
-    // Participant updates (join, leave, track changes)
+    // Participant updates (join, leave, track changes). Before the join response is applied the
+    // local participant is unknown, so updates are kept for connect() to replay.
     this.engine.signal.on('participantUpdate', (update) => {
+      if (this.earlyParticipantUpdates) {
+        this.earlyParticipantUpdates.push(update);
+        return;
+      }
       this.handleParticipantUpdate(update);
     });
 
     // Speakers changed
     this.engine.signal.on('speakersChanged', (changed) => {
+      // Momentary state; the next change after the join carries the current speakers.
+      if (this.earlyParticipantUpdates) return;
       this.handleSpeakersChanged(changed);
     });
 
@@ -292,6 +309,9 @@ export class Room extends TypedEmitter<RoomEvents> {
       this.flushPendingTracks();
     }
   }
+
+  /** Participant updates received during connect(), before the join response was applied */
+  private earlyParticipantUpdates: ParticipantUpdate[] | null = [];
 
   /** Pending tracks waiting for participant/publication info to arrive */
   private pendingTracks: Array<{ mediaTrack: any; participantSid: string; trackSid: string }> = [];

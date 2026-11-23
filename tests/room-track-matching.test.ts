@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { unpackStreamId, Room } from '../src/room';
 import { ParticipantInfo_State, TrackType, TrackSource } from '../src/proto/models';
+import { EventEmitter } from 'events';
 
 // ─── unpackStreamId ─────────────────────────────────────────────────────────
 
@@ -254,5 +255,88 @@ describe('Room track matching', () => {
     expect(subscribed).toHaveLength(2);
     // Old track should have been removed first
     expect(unsubscribed).toHaveLength(1);
+  });
+});
+
+// ─── Events that arrive while connect() waits for ICE ───────────────────────
+
+function participantInfo(sid: string, identity: string, trackSid: string) {
+  return {
+    sid,
+    identity,
+    name: identity,
+    metadata: '',
+    state: ParticipantInfo_State.ACTIVE,
+    tracks: [
+      {
+        sid: trackSid, name: 'microphone', type: TrackType.AUDIO, source: TrackSource.MICROPHONE,
+        muted: false, width: 0, height: 0, simulcast: false, disableDtx: false, layers: [],
+        mimeType: 'audio/opus', mid: '',
+      },
+    ],
+    region: '',
+    isPublisher: true,
+    joinedAt: 0,
+    permission: undefined,
+    version: 0,
+  };
+}
+
+/**
+ * Replaces the room's engine with one whose connect() emits, before it resolves, what a real SFU
+ * sends during the ICE wait: the existing participant's track, a participant who joins and
+ * publishes, and a speaker update.
+ */
+function roomWithJoinTimeEvents() {
+  const room = new Room();
+  const engine = new EventEmitter() as any;
+  engine.signal = new EventEmitter();
+  engine.disconnect = vi.fn();
+  engine.connect = vi.fn(async () => {
+    engine.emit('remoteTrack', fakeMediaTrack(), fakeTransceiver('PA_vadim|TR_v1'));
+    engine.signal.emit('participantUpdate', { participants: [participantInfo('PA_jack', 'jack', 'TR_j1')] });
+    engine.emit('remoteTrack', fakeMediaTrack(), fakeTransceiver('PA_jack|TR_j1'));
+    engine.signal.emit('speakersChanged', { speakers: [{ sid: 'PA_vadim', level: 0.5, active: true }] });
+    return {
+      room: { name: 'room1', sid: 'RM_1', metadata: '' },
+      participant: { sid: 'PA_local', identity: 'bot', name: 'bot', metadata: '', permission: undefined },
+      otherParticipants: [participantInfo('PA_vadim', 'vadim', 'TR_v1')],
+    };
+  });
+  (room as any).engine = engine;
+  return room;
+}
+
+describe('Room.connect keeps events from the join', () => {
+  it('matches a track that was already published when the bot joined', async () => {
+    const room = roomWithJoinTimeEvents();
+    await room.connect('wss://node', 'token');
+
+    const vadim = room.getParticipantByIdentity('vadim')!;
+    expect(vadim.trackPublications.get('TR_v1')?.track).toBeTruthy();
+    expect((room as any).pendingTracks).toHaveLength(0);
+  });
+
+  it('applies participant updates sent during the join', async () => {
+    const room = roomWithJoinTimeEvents();
+    const connected: string[] = [];
+    room.on('participantConnected', (p) => connected.push(p.identity));
+    await room.connect('wss://node', 'token');
+
+    expect(connected).toEqual(['jack']);
+    expect(room.getParticipantByIdentity('jack')?.trackPublications.get('TR_j1')?.track).toBeTruthy();
+  });
+
+  it('handles updates normally once connected', async () => {
+    const room = roomWithJoinTimeEvents();
+    await room.connect('wss://node', 'token');
+    const engine = (room as any).engine;
+
+    const subscribed: string[] = [];
+    room.on('trackSubscribed', (_t, _p, participant) => subscribed.push(participant.identity));
+    engine.signal.emit('participantUpdate', { participants: [participantInfo('PA_ann', 'ann', 'TR_a1')] });
+    engine.emit('remoteTrack', fakeMediaTrack(), fakeTransceiver('PA_ann|TR_a1'));
+
+    expect(subscribed).toEqual(['ann']);
   });
 });

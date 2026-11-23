@@ -2,6 +2,8 @@
 
 Node.js RTC SDK for dTelecom — join rooms as a WebRTC participant for AI bots.
 
+**Documentation:** [docs.dtelecom.org](https://docs.dtelecom.org), see [Server-side media](https://docs.dtelecom.org/guides/server-side-media/) for bots in dTelecom Cloud rooms. The bot joins with a token from your backend (`@dtelecom/server-sdk-js` `createToken`), like any participant.
+
 ## Features
 
 - **WebRTC participant** — join dTelecom rooms as a bot
