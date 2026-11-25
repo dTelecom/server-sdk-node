@@ -1,0 +1,64 @@
+name: SDK checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        node: ['22.14.0', '24.x']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Install and exercise the packed SDK in an empty project
+        run: bash test-support/prepare-consumer.sh "$(mktemp -d)"
+
+  live:
+    name: Live browser echo
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    environment: sdk-live-tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.14.0'
+          package-manager-cache: false
+      - name: Build and prepare the browser consumer
+        run: |
+          npm ci
+          npm run build
+          mkdir "$RUNNER_TEMP/consumer"
+          bash test-support/prepare-consumer.sh "$RUNNER_TEMP/consumer" live
+          cd "$RUNNER_TEMP/consumer"
+          npx --no-install playwright-core install --with-deps chromium
+      - name: Exercise the live Cloud room
+        working-directory: ${{ runner.temp }}/consumer
+        env:
+          DTELECOM_CLOUD_URL: ${{ vars.DTELECOM_CLOUD_URL || secrets.DTELECOM_CLOUD_URL }}
+          DTELECOM_API_KEY: ${{ secrets.DTELECOM_API_KEY }}
+          DTELECOM_API_SECRET: ${{ secrets.DTELECOM_API_SECRET }}
+        run: timeout 150s node live-echo.mjs

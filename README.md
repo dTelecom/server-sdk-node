@@ -163,6 +163,12 @@ node --env-file=.env --import tsx examples/send-audio.ts --room audio-demo --inp
 | `ws` | WebSocket client | No |
 | `protobufjs` | Protobuf encode/decode | No |
 
+## CI and live verification
+
+`SDK checks` runs lint, tests and a build on Node 22.14.0 and 24.x. It installs the resulting npm tarball in an empty consumer project and checks the Opus encoder. To repeat the package check locally, run `npm ci && npm run build`, then `bash test-support/prepare-consumer.sh "$(mktemp -d)"`.
+
+To run the hosted media test, dispatch **SDK checks** on `main`. Configure the `sdk-live-tests` GitHub environment with `DTELECOM_CLOUD_URL`, `DTELECOM_API_KEY` and `DTELECOM_API_SECRET` from a Cloud project with WebRTC balance. Chromium publishes a 640 Hz tone to a unique room. The test checks received RTP and the frequency of the decoded echo. The job disconnects the participants after the call.
+
 ## License
 
 Apache-2.0
