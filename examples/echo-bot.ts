@@ -4,66 +4,45 @@
  * Joins a dTelecom room, subscribes to all audio, and echoes it back.
  *
  * Usage:
- *   DTELECOM_URL=wss://my.dtelecom.org \
+ *   DTELECOM_CLOUD_URL=https://cloud.dtelecom.org \
  *   DTELECOM_API_KEY=... \
  *   DTELECOM_API_SECRET=... \
  *   npx tsx examples/echo-bot.ts --room my-room
  */
 
+import { parseArgs } from 'node:util';
+import { CloudClient } from '@dtelecom/server-sdk-js';
 import {
   Room,
   AudioSource,
-  AudioStream,
-  AudioFrame,
   LocalAudioTrack,
   RemoteAudioTrack,
   RemoteTrackPublication,
   RemoteParticipant,
   setLogLevel,
   LogLevel,
-} from '../src';
+} from '@dtelecom/server-sdk-node';
 
-// Parse args
-const args = process.argv.slice(2);
-const roomName = args[args.indexOf('--room') + 1] || 'echo-test';
-
-const url = process.env.DTELECOM_URL || 'wss://my.dtelecom.org';
-const apiKey = process.env.DTELECOM_API_KEY;
-const apiSecret = process.env.DTELECOM_API_SECRET;
-
-if (!apiKey || !apiSecret) {
-  console.error('Set DTELECOM_API_KEY and DTELECOM_API_SECRET environment variables');
-  process.exit(1);
-}
-
-async function generateToken(roomName: string, identity: string): Promise<string> {
-  // Use @dtelecom/server-sdk-js to generate token
-  const { AccessToken } = await import('@dtelecom/server-sdk-js');
-  const token = new AccessToken(apiKey, apiSecret, { identity });
-  token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
-  return token.toJwt();
-}
+const { values: { room: roomName } } = parseArgs({
+  options: {
+    room: { type: 'string', default: 'audio-demo' },
+  },
+});
 
 async function main() {
-  setLogLevel(LogLevel.DEBUG);
+  setLogLevel(LogLevel.INFO);
 
   console.log(`Echo bot starting for room: ${roomName}`);
 
   // Generate token
-  const token = await generateToken(roomName, 'echo-bot');
+  const { token, wsUrl } = await new CloudClient().createToken({
+    room: roomName, identity: 'echo-bot', ttl: '10m',
+  });
 
   // Create room and audio source
   const room = new Room();
   const source = new AudioSource(16000, 1);
   const track = LocalAudioTrack.createAudioTrack('echo', source);
-
-  // Connect
-  await room.connect(url, token);
-  console.log(`Connected as ${room.localParticipant.identity}`);
-
-  // Publish our audio track
-  await room.localParticipant.publishTrack(track);
-  console.log('Audio track published');
 
   // Subscribe to remote audio and echo it back
   room.on('trackSubscribed', async (
@@ -90,6 +69,14 @@ async function main() {
     console.log(`Disconnected: ${reason}`);
     process.exit(0);
   });
+
+  // Connect
+  await room.connect(wsUrl, token);
+  console.log(`Connected as ${room.localParticipant.identity}`);
+
+  // Publish our audio track
+  await room.localParticipant.publishTrack(track);
+  console.log('Audio track published');
 
   // Handle shutdown
   process.on('SIGINT', async () => {

@@ -13,35 +13,48 @@ Node.js RTC SDK for dTelecom — join rooms as a WebRTC participant for AI bots.
 - **Pure TypeScript WebRTC** — uses [werift](https://github.com/shinyoshiaki/werift-webrtc) (no native WebRTC deps)
 - **Opus codec** — [opusscript](https://github.com/abalabahaha/opusscript) (libopus compiled to WASM; nothing to build at install)
 
-## Install
+## Quick start with an echo bot
+
+Use Node.js 22 or later and a dTelecom Cloud project with WebRTC balance. In a new directory, install the RTC participant and the SDK that issues its token.
 
 ```bash
-npm install @dtelecom/server-sdk-node
+npm install @dtelecom/server-sdk-node @dtelecom/server-sdk-js
 ```
 
-Requires Node.js 22 or later. Nothing is compiled at install time.
+Create a local `.env` file and fill in your Cloud project credentials. Keep this file on the backend.
 
-## Quick Start: Echo Bot
+```dotenv
+DTELECOM_CLOUD_URL=https://cloud.dtelecom.org
+DTELECOM_API_KEY=
+DTELECOM_API_SECRET=
+```
 
-```typescript
-import { Room, AudioSource, AudioStream, AudioFrame, LocalAudioTrack } from '@dtelecom/server-sdk-node';
+Save this as `echo.mjs`. Cloud chooses the node and returns its signaling URL with the participant token.
 
+```js
+import { CloudClient } from '@dtelecom/server-sdk-js';
+import { Room, AudioSource, LocalAudioTrack } from '@dtelecom/server-sdk-node';
+
+const { token, wsUrl } = await new CloudClient().createToken({
+  room: 'audio-demo', identity: 'echo-bot', ttl: '10m',
+});
 const room = new Room();
-await room.connect('wss://my.dtelecom.org', token);
-
-// Create audio output
 const source = new AudioSource(16000, 1);
-const track = LocalAudioTrack.createAudioTrack('echo', source);
-await room.localParticipant.publishTrack(track);
-
-// Echo received audio back
-room.on('trackSubscribed', async (remoteTrack, pub, participant) => {
-  const stream = remoteTrack.createStream(16000, 1);
-  for await (const frame of stream) {
-    await source.captureFrame(frame); // echo back
+room.on('trackSubscribed', async (remoteTrack) => {
+  for await (const frame of remoteTrack.createStream(16000, 1)) {
+    await source.captureFrame(frame);
   }
 });
+await room.connect(wsUrl, token);
+await room.localParticipant.publishTrack(LocalAudioTrack.createAudioTrack('echo', source));
+console.log('Echo bot is listening in audio-demo');
+process.once('SIGINT', async () => {
+  await room.disconnect();
+  process.exit(0);
+});
 ```
+
+Run `node --env-file=.env echo.mjs`. Join `audio-demo` from your app using the same Cloud project and a different participant identity. Enable your microphone and audio playback, then speak using headphones to hear the echo. Press Ctrl+C to disconnect the bot. [Connect a browser participant](https://docs.dtelecom.org/quickstart/)
 
 ## Architecture
 
@@ -120,15 +133,25 @@ room.on('dataReceived', (data, participant, kind, topic) => {
 
 ## Examples
 
+From a checkout of this repository, build the RTC SDK and install the Cloud SDK and TypeScript runner for the examples. Set up the backend `.env` described above.
+
 ```bash
-# Echo bot — echoes received audio back
-npx tsx examples/echo-bot.ts --room test
+npm ci
+npm run build
+npm install --no-save @dtelecom/server-sdk-js tsx
+```
 
-# Record audio — saves remote audio to PCM file
-npx tsx examples/receive-audio.ts --room test --output recording.pcm
+Run each example from the checkout root. The sender accepts raw little-endian PCM16 at 16 kHz, mono. Start a listener before the sender.
 
-# Play audio — sends PCM file into room
-npx tsx examples/send-audio.ts --room test --input hello.pcm
+```bash
+# Listen and echo incoming audio
+node --env-file=.env --import tsx examples/echo-bot.ts --room audio-demo
+
+# Record incoming audio to a raw PCM file
+node --env-file=.env --import tsx examples/receive-audio.ts --room audio-demo --output recording.pcm
+
+# Publish an input file as an audio track
+node --env-file=.env --import tsx examples/send-audio.ts --room audio-demo --input hello.pcm
 ```
 
 ## Dependencies

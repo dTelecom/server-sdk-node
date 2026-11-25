@@ -7,13 +7,15 @@
  *   # First, create a PCM16 file from a WAV:
  *   ffmpeg -i hello.wav -f s16le -ar 16000 -ac 1 hello.pcm
  *
- *   DTELECOM_URL=wss://my.dtelecom.org \
+ *   DTELECOM_CLOUD_URL=https://cloud.dtelecom.org \
  *   DTELECOM_API_KEY=... \
  *   DTELECOM_API_SECRET=... \
  *   npx tsx examples/send-audio.ts --room my-room --input hello.pcm
  */
 
 import * as fs from 'fs';
+import { parseArgs } from 'node:util';
+import { CloudClient } from '@dtelecom/server-sdk-js';
 import {
   Room,
   AudioSource,
@@ -21,27 +23,14 @@ import {
   LocalAudioTrack,
   setLogLevel,
   LogLevel,
-} from '../src';
+} from '@dtelecom/server-sdk-node';
 
-const args = process.argv.slice(2);
-const roomName = args[args.indexOf('--room') + 1] || 'play-test';
-const inputPath = args[args.indexOf('--input') + 1] || 'hello.pcm';
-
-const url = process.env.DTELECOM_URL || 'wss://my.dtelecom.org';
-const apiKey = process.env.DTELECOM_API_KEY;
-const apiSecret = process.env.DTELECOM_API_SECRET;
-
-if (!apiKey || !apiSecret) {
-  console.error('Set DTELECOM_API_KEY and DTELECOM_API_SECRET environment variables');
-  process.exit(1);
-}
-
-async function generateToken(roomName: string, identity: string): Promise<string> {
-  const { AccessToken } = await import('@dtelecom/server-sdk-js');
-  const token = new AccessToken(apiKey, apiSecret, { identity });
-  token.addGrant({ roomJoin: true, room: roomName, canPublish: true });
-  return token.toJwt();
-}
+const { values: { room: roomName, input: inputPath } } = parseArgs({
+  options: {
+    room: { type: 'string', default: 'audio-demo' },
+    input: { type: 'string', default: 'hello.pcm' },
+  },
+});
 
 /** Sleep for ms milliseconds */
 function sleep(ms: number): Promise<void> {
@@ -59,13 +48,15 @@ async function main() {
 
   console.log(`Playing ${inputPath} into room: ${roomName}`);
 
-  const token = await generateToken(roomName, 'player-bot');
+  const { token, wsUrl } = await new CloudClient().createToken({
+    room: roomName, identity: 'player-bot', ttl: '10m', grants: { canSubscribe: false },
+  });
   const room = new Room();
 
   const source = new AudioSource(16000, 1);
   const track = LocalAudioTrack.createAudioTrack('player', source);
 
-  await room.connect(url, token);
+  await room.connect(wsUrl, token);
   console.log(`Connected as ${room.localParticipant.identity}`);
 
   await room.localParticipant.publishTrack(track);

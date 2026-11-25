@@ -4,7 +4,7 @@
  * Joins a dTelecom room, subscribes to audio, and saves PCM16 to a file.
  *
  * Usage:
- *   DTELECOM_URL=wss://my.dtelecom.org \
+ *   DTELECOM_CLOUD_URL=https://cloud.dtelecom.org \
  *   DTELECOM_API_KEY=... \
  *   DTELECOM_API_SECRET=... \
  *   npx tsx examples/receive-audio.ts --room my-room --output recording.pcm
@@ -16,6 +16,8 @@
  */
 
 import * as fs from 'fs';
+import { parseArgs } from 'node:util';
+import { CloudClient } from '@dtelecom/server-sdk-js';
 import {
   Room,
   RemoteAudioTrack,
@@ -23,27 +25,14 @@ import {
   RemoteParticipant,
   setLogLevel,
   LogLevel,
-} from '../src';
+} from '@dtelecom/server-sdk-node';
 
-const args = process.argv.slice(2);
-const roomName = args[args.indexOf('--room') + 1] || 'record-test';
-const outputPath = args[args.indexOf('--output') + 1] || 'recording.pcm';
-
-const url = process.env.DTELECOM_URL || 'wss://my.dtelecom.org';
-const apiKey = process.env.DTELECOM_API_KEY;
-const apiSecret = process.env.DTELECOM_API_SECRET;
-
-if (!apiKey || !apiSecret) {
-  console.error('Set DTELECOM_API_KEY and DTELECOM_API_SECRET environment variables');
-  process.exit(1);
-}
-
-async function generateToken(roomName: string, identity: string): Promise<string> {
-  const { AccessToken } = await import('@dtelecom/server-sdk-js');
-  const token = new AccessToken(apiKey, apiSecret, { identity });
-  token.addGrant({ roomJoin: true, room: roomName, canSubscribe: true });
-  return token.toJwt();
-}
+const { values: { room: roomName, output: outputPath } } = parseArgs({
+  options: {
+    room: { type: 'string', default: 'audio-demo' },
+    output: { type: 'string', default: 'recording.pcm' },
+  },
+});
 
 async function main() {
   setLogLevel(LogLevel.INFO);
@@ -51,13 +40,12 @@ async function main() {
   console.log(`Recording audio from room: ${roomName}`);
   console.log(`Output file: ${outputPath}`);
 
-  const token = await generateToken(roomName, 'recorder-bot');
+  const { token, wsUrl } = await new CloudClient().createToken({
+    room: roomName, identity: 'recorder-bot', ttl: '10m', grants: { canPublish: false },
+  });
   const room = new Room();
   const outputStream = fs.createWriteStream(outputPath);
   let totalSamples = 0;
-
-  await room.connect(url, token);
-  console.log(`Connected as ${room.localParticipant.identity}`);
 
   room.on('trackSubscribed', async (
     remoteTrack: RemoteAudioTrack,
@@ -89,6 +77,9 @@ async function main() {
     console.log(`\nRecording complete: ${duration}s saved to ${outputPath}`);
     process.exit(0);
   });
+
+  await room.connect(wsUrl, token);
+  console.log(`Connected as ${room.localParticipant.identity}`);
 
   process.on('SIGINT', async () => {
     console.log('\nStopping recording...');
