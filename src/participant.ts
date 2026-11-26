@@ -95,7 +95,7 @@ export interface DataPublishOptions {
 
 export class LocalParticipant extends Participant {
   private engine: RTCEngine;
-  private publishedTracks = new Map<string, LocalAudioTrack>();
+  private publishedTracks = new Map<string, { track: LocalAudioTrack; options?: TrackPublishOptions }>();
 
   constructor(engine: RTCEngine, sid: string, identity: string, name: string = '', metadata: string = '') {
     super(sid, identity, name, metadata);
@@ -112,6 +112,7 @@ export class LocalParticipant extends Participant {
    * 4. Negotiate SDP
    */
   async publishTrack(track: LocalAudioTrack, options?: TrackPublishOptions): Promise<LocalTrackPublication> {
+    const engine = this.engine;
     const name = options?.name ?? track.name;
     const source = options?.source ?? TrackSource.MICROPHONE;
     const disableDtx = options?.disableDtx ?? false;
@@ -124,7 +125,7 @@ export class LocalParticipant extends Participant {
     log.info(`Publishing track "${name}" (cid=${track.cid})`);
 
     // Step 1: Request track publication from server
-    const response = await this.engine.requestPublishTrack(
+    const response = await engine.requestPublishTrack(
       track.cid,
       name,
       TrackType.AUDIO,
@@ -141,24 +142,40 @@ export class LocalParticipant extends Participant {
     log.debug(`Track published: cid=${track.cid}, sid=${track.sid}`);
 
     // Step 3: Add transceiver to publisher PC with the media track
-    const transceiver = await this.engine.addTransceiver(track.mediaTrack);
+    const transceiver = await engine.addTransceiver(track.mediaTrack);
 
     // Step 4: Negotiate (waits for SDP answer)
-    await this.engine.negotiate();
+    await engine.negotiate();
 
     // Step 5: Wait for publisher ICE+DTLS to connect before wiring audio
-    await this.engine.waitForPublisherConnected();
+    await engine.waitForPublisherConnected();
 
     // Step 6: Wire audio source to transceiver (only after media path is ready)
+    if (engine !== this.engine) throw new Error('Transport changed while publishing');
     track.setTransceiver(transceiver);
 
     // Create publication
     const publication = new LocalTrackPublication(response.track, track);
     this._trackPublications.set(response.track.sid, publication);
-    this.publishedTracks.set(track.cid, track);
+    this.publishedTracks.set(track.cid, { track, options });
 
     this.emit('trackPublished', publication);
     return publication;
+  }
+
+  /** @internal Bind existing application references and publications to a fresh transport. */
+  async restore(engine: RTCEngine): Promise<void> {
+    this.engine = engine;
+    const publications = [...this.publishedTracks.values()];
+    this._trackPublications.clear();
+    for (const { track, options } of publications) {
+      if (this.publishedTracks.has(track.cid)) await this.publishTrack(track, options);
+    }
+  }
+
+  /** @internal Stop sending encoded frames to the lost transport during recovery. */
+  detachTransport(): void {
+    for (const { track } of this.publishedTracks.values()) track.source.onEncodedFrame = null;
   }
 
   /**

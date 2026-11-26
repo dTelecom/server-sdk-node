@@ -4,7 +4,7 @@ import { chromium } from 'playwright-core';
 
 // Run inside a clean consumer with the public browser SDK, playwright-core and its Chromium.
 export async function browserCall({ cloud, room, peer, speechWav, inputReady, replyComplete }) {
-  const { token, wsUrl } = await cloud.createToken({ room, identity: 'browser', ttl: '3m' });
+  const { token, wsUrl, fallbackUrls } = await cloud.createToken({ room, identity: 'browser', ttl: '3m' });
   const bundle = await readFile(new URL('./node_modules/@dtelecom/livekit-client/dist/livekit-client.esm.mjs', import.meta.url));
   const browser = await chromium.launch({
     executablePath: process.env.CHROME_EXECUTABLE || undefined,
@@ -21,7 +21,7 @@ export async function browserCall({ cloud, room, peer, speechWav, inputReady, re
       await page.exposeFunction('replyComplete', replyComplete);
     }
     await page.goto('http://localhost/');
-    const evidence = await page.evaluate(publishAndListen, { token, wsUrl, peer, speech: Boolean(speechWav) });
+    const evidence = await page.evaluate(publishAndListen, { token, wsUrl, fallbackUrls, peer, speech: Boolean(speechWav) });
     assert.ok(evidence.packets > 0 && evidence.audible >= 15, 'Expected audible inbound RTP on the remote track');
     if (!speechWav) assert.ok(evidence.tone >= 15, 'Expected a 640 Hz echo');
     console.log('Browser received audio', evidence);
@@ -30,7 +30,7 @@ export async function browserCall({ cloud, room, peer, speechWav, inputReady, re
   }
 }
 
-async function publishAndListen({ token, wsUrl, peer, speech }) {
+async function publishAndListen({ token, wsUrl, fallbackUrls, peer, speech }) {
   const { Room, RoomEvent, Track } = await import('/client.mjs');
   const room = new Room();
   const audio = new AudioContext();
@@ -68,7 +68,7 @@ async function publishAndListen({ token, wsUrl, peer, speech }) {
 
   try {
     await audio.resume();
-    await room.connect(wsUrl, token);
+    await room.connect(wsUrl, token, { fallbackUrls });
     const microphone = audio.createMediaStreamDestination();
     const oscillator = audio.createOscillator();
     const gain = audio.createGain();

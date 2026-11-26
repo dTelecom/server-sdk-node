@@ -13,8 +13,8 @@ room.on('trackSubscribed', async (track, _publication, participant) => {
   for await (const frame of track.createStream(16000, 1)) await source.captureFrame(frame);
 });
 try {
-  const { wsUrl, token } = await cloud.createToken({ room: roomName, identity: 'echo', ttl: '3m' });
-  await room.connect(wsUrl, token);
+  const { wsUrl, token, fallbackUrls } = await cloud.createToken({ room: roomName, identity: 'echo', ttl: '3m' });
+  await room.connect(wsUrl, token, { fallbackUrls });
   await room.localParticipant.publishTrack(LocalAudioTrack.createAudioTrack('echo', source));
   await browserCall({ cloud, room: roomName, peer: 'echo' });
 } finally {

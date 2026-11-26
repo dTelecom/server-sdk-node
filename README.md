@@ -35,7 +35,7 @@ Save this as `echo.mjs`. Cloud chooses the node and returns its signaling URL wi
 import { CloudClient } from '@dtelecom/server-sdk-js';
 import { Room, AudioSource, LocalAudioTrack } from '@dtelecom/server-sdk-node';
 
-const { token, wsUrl } = await new CloudClient().createToken({
+const { token, wsUrl, fallbackUrls } = await new CloudClient().createToken({
   room: 'audio-demo', identity: 'echo-bot', ttl: '10m',
 });
 const room = new Room();
@@ -45,7 +45,7 @@ room.on('trackSubscribed', async (remoteTrack) => {
     await source.captureFrame(frame);
   }
 });
-await room.connect(wsUrl, token);
+await room.connect(wsUrl, token, { fallbackUrls });
 await room.localParticipant.publishTrack(LocalAudioTrack.createAudioTrack('echo', source));
 console.log('Echo bot is listening in audio-demo');
 process.once('SIGINT', async () => {
@@ -85,6 +85,8 @@ room.on('disconnected', (reason) => { }); // client_initiated, or the node's: pa
 
 await room.disconnect();
 ```
+
+Pass the ranked signaling URLs returned by your token issuer as `fallbackUrls`. The room tries the primary first, then each distinct alternative on a transport failure. With alternatives available, a lost connection emits `reconnecting`, retries the serving node and then the other ranked nodes, republishes local audio, and emits `reconnected`. Publishing data resumes on the new transport. A rejected grant, a server-requested removal or a call to `disconnect()` ends the session. When extending a Cloud token, pass its replacement token and candidates to `room.updateConnectionToken(token, fallbackUrls)` so that a later reconnect uses the new grant.
 
 ### Audio
 

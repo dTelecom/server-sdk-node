@@ -24,6 +24,7 @@ import {
   TrackPublishedResponse,
   AddTrackRequest,
 } from './proto/signal';
+import { SessionEnded, TransportError } from './connection';
 import { TrackType, TrackSource, ICEServer, DisconnectReason } from './proto/models';
 
 const log = createLogger('RTCEngine');
@@ -48,7 +49,7 @@ export function parseTrickleCandidate(candidateInit: string): RTCIceCandidate {
 export interface EngineEvents {
   [key: string]: (...args: any[]) => void;
   connected: () => void;
-  disconnected: (reason?: string) => void;
+  disconnected: (reason?: string, transportFailure?: boolean) => void;
   remoteTrack: (track: MediaStreamTrack, transceiver: RTCRtpTransceiver) => void;
   dataMessage: (data: Uint8Array, kind: 'reliable' | 'lossy') => void;
   dataChannelReady: () => void;
@@ -72,12 +73,13 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
   private subscriberReliableChannel: RTCDataChannel | null = null;
   private subscriberLossyChannel: RTCDataChannel | null = null;
 
+  private closed = false;
   private subscriberPrimary = true;
   private _isConnected = false;
   private pendingCandidates: { candidate: RTCIceCandidate; target: SignalTarget }[] = [];
   private joinResponse: JoinResponse | null = null;
 
-  private publishWaiters: Map<string, (response: TrackPublishedResponse) => void> = new Map();
+  private publishWaiters = new Map<string, { resolve: (response: TrackPublishedResponse) => void; reject: (error: Error) => void }>();
   private _negotiateResolve: (() => void) | null = null;
   /** Negotiations run one at a time: there is one slot for the pending answer. */
   private negotiateChain: Promise<void> = Promise.resolve();
@@ -110,6 +112,16 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
   constructor() {
     super();
     this.signal = new SignalClient();
+    // The node ends the session, e.g. RoomService.RemoveParticipant (participant_removed), a
+    // second join with the same identity (duplicate_identity) or a deleted room (room_deleted).
+    this.signal.on('leave', (request) => {
+      this.disconnect(leaveReason(request?.reason));
+    });
+
+    this.signal.on('close', (reason, retryable = true) => {
+      this._isConnected = false;
+      if (!this.closed) this.emit('disconnected', reason, retryable);
+    });
   }
 
   async connect(url: string, token: string, options: EngineOptions = {}): Promise<JoinResponse> {
@@ -117,6 +129,7 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
       autoSubscribe: options.autoSubscribe ?? true,
       connectTimeout: options.connectTimeout ?? 10000,
     });
+    if (this.closed) throw new SessionEnded('client_initiated');
     this.joinResponse = joinResponse;
     this.subscriberPrimary = joinResponse.subscriberPrimary;
 
@@ -159,7 +172,7 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
 
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error(
+        reject(new TransportError(
           `Primary PC ICE timed out after ${timeoutMs}ms (state: ${pc.iceConnectionState})`,
         ));
       }, timeoutMs);
@@ -168,9 +181,9 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
         if (state === 'connected' || state === 'completed') {
           clearTimeout(timeout);
           resolve();
-        } else if (state === 'failed') {
+        } else if (state === 'failed' || state === 'closed') {
           clearTimeout(timeout);
-          reject(new Error('Primary PC ICE failed'));
+          reject(new TransportError(`Primary PC ICE ${state}`));
         }
       };
 
@@ -206,8 +219,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
       sid: '',
     };
 
-    return new Promise<TrackPublishedResponse>((resolve) => {
-      this.publishWaiters.set(cid, resolve);
+    return new Promise<TrackPublishedResponse>((resolve, reject) => {
+      if (this.closed) {
+        reject(new SessionEnded('Transport closed'));
+        return;
+      }
+      this.publishWaiters.set(cid, { resolve, reject });
       this.signal.sendAddTrack(request);
     });
   }
@@ -324,18 +341,19 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
    * `client_initiated` when the app leaves, the node's reason when the node ends the session.
    */
   async disconnect(reason = 'client_initiated'): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     this._isConnected = false;
 
     try {
-      this.signal.sendLeave();
+      if (this.signal.isConnected) this.signal.sendLeave();
     } catch {
       // ignore
     }
 
     this.reliableChannel?.close();
     this.lossyChannel?.close();
-    this.publisher?.close();
-    this.subscriber?.close();
+    const closed = [this.publisher?.close(), this.subscriber?.close()];
     this.signal.close();
 
     this.publisher = null;
@@ -344,10 +362,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
     this.lossyChannel = null;
     this.subscriberReliableChannel = null;
     this.subscriberLossyChannel = null;
+    for (const waiter of this.publishWaiters.values()) waiter.reject(new SessionEnded(reason));
     this.publishWaiters.clear();
 
     log.info(`Disconnected: ${reason}`);
     this.emit('disconnected', reason);
+    await Promise.all(closed);
   }
 
   // ─── Private ────────────────────────────────────────────────────────────
@@ -436,7 +456,7 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
         }
       } else if (state === 'disconnected' || state === 'failed') {
         this._isConnected = false;
-        this.emit('disconnected', `ICE ${state}`);
+        if (!this.closed) this.emit('disconnected', `ICE ${state}`, true);
       }
     });
 
@@ -564,21 +584,12 @@ export class RTCEngine extends TypedEmitter<EngineEvents> {
       const waiter = this.publishWaiters.get(response.cid);
       if (waiter) {
         this.publishWaiters.delete(response.cid);
-        waiter(response);
+        waiter.resolve(response);
       }
       this.emit('trackPublished', response);
     });
 
-    // The node ends the session, e.g. RoomService.RemoveParticipant (participant_removed), a
-    // second join with the same identity (duplicate_identity) or a deleted room (room_deleted).
-    this.signal.on('leave', (request) => {
-      this.disconnect(leaveReason(request?.reason));
-    });
 
-    this.signal.on('close', (reason) => {
-      this._isConnected = false;
-      this.emit('disconnected', reason);
-    });
   }
 
   private flushPendingCandidates(target: SignalTarget): void {

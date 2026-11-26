@@ -10,6 +10,7 @@
 import { TypedEmitter } from './utils/events';
 import { createLogger } from './utils/logger';
 import { RTCEngine } from './engine';
+import { rankedUrls, SessionEnded, TransportError } from './connection';
 import {
   LocalParticipant,
   RemoteParticipant,
@@ -61,6 +62,17 @@ export interface RoomOptions {
   autoSubscribe?: boolean;
   /** Connection timeout in ms (default: 10000) */
   connectTimeout?: number;
+  /** Signaling URLs supplied by the token issuer in preferred order. */
+  fallbackUrls?: string[];
+}
+
+interface RoomSession {
+  token: string;
+  primary: string;
+  serving: string;
+  urls: string[];
+  options: RoomOptions;
+  controller: AbortController;
 }
 
 // ─── Room Events ────────────────────────────────────────────────────────────
@@ -99,6 +111,7 @@ export class Room extends TypedEmitter<RoomEvents> {
 
   private engine: RTCEngine;
   private _isConnected = false;
+  private session?: RoomSession;
   private activeSpeakers: Array<LocalParticipant | RemoteParticipant> = [];
   private roomInfo: RoomInfo | null = null;
   /** Identity-prefixed logger for debugging multi-Room scenarios */
@@ -121,54 +134,124 @@ export class Room extends TypedEmitter<RoomEvents> {
    * @param options Room connection options
    */
   async connect(url: string, token: string, options: RoomOptions = {}): Promise<void> {
-    log.info('Connecting to room...');
-
-    // Listen before connecting: engine.connect() waits for ICE after the join, and the SFU sends
-    // the existing participants' tracks and participant updates during that wait. A listener
-    // added afterwards misses them, so a bot that joins after someone published never hears them.
-    // Updates that arrive before the join response is applied are queued and replayed below.
-    this.setupEngineHandlers();
-    this.setupSignalHandlers();
-
-    // Connect via engine (signal + WebRTC)
-    const joinResponse = await this.engine.connect(url, token, {
-      autoSubscribe: options.autoSubscribe ?? true,
-      connectTimeout: options.connectTimeout ?? 10000,
-    });
-
-    // Initialize room state from JoinResponse
-    this.handleJoinResponse(joinResponse);
-
-    // Apply what arrived during the connect, in order, then match tracks queued before their
-    // participant was known.
-    const early = this.earlyParticipantUpdates;
-    this.earlyParticipantUpdates = null;
-    for (const update of early ?? []) {
-      this.handleParticipantUpdate(update);
+    if (this.session) throw new Error('Room already connecting or connected');
+    const session: RoomSession = {
+      primary: url,
+      serving: url,
+      token,
+      urls: rankedUrls(url, options.fallbackUrls),
+      options,
+      controller: new AbortController(),
+    };
+    this.session = session;
+    try {
+      await this.joinRanked(session, false);
+    } catch (error) {
+      if (this.session === session) this.session = undefined;
+      throw error;
     }
-    this.flushPendingTracks();
-
-    this._isConnected = true;
-    this.log = log;
-    log.info(`[${this.localParticipant.identity}] Connected to room "${this.name}"`);
   }
 
-  /**
-   * Disconnect from the room.
-   */
-  async disconnect(): Promise<void> {
-    if (!this._isConnected) return;
-
-    log.info('Disconnecting from room...');
-    this._isConnected = false;
-
-    // Clean up remote participants
-    for (const [sid, participant] of this.remoteParticipants) {
-      participant.destroy();
-      this.remoteParticipants.delete(sid);
+  /** Replace the credential and optional ranked endpoints used on a future full reconnect. */
+  updateConnectionToken(token: string, fallbackUrls?: string[]): void {
+    if (!this.session) return;
+    this.session.token = token;
+    if (fallbackUrls) {
+      this.session.primary = fallbackUrls[0] ?? this.session.primary;
+      this.session.urls = rankedUrls(this.session.primary, fallbackUrls);
     }
+  }
 
-    await this.engine.disconnect();
+  private async joinRanked(session: RoomSession, restoring: boolean): Promise<void> {
+    const attempted = new Set<string>();
+    let endpoint = session.urls.includes(session.serving) ? session.serving : session.urls[0];
+    while (true) {
+      attempted.add(endpoint);
+      const signal = session.controller.signal;
+      signal.throwIfAborted();
+      const engine = this.engine;
+      this.earlyParticipantUpdates = [];
+      this.pendingTracks = [];
+      this.setupEngineHandlers();
+      this.setupSignalHandlers();
+
+      let fail!: (error: Error) => void;
+      const interrupted = new Promise<never>((_, reject) => { fail = reject; });
+      const onAbort = () => fail(new SessionEnded('client_initiated'));
+      const onLoss = (reason?: string, transport?: boolean) =>
+        fail(transport ? new TransportError(reason) : new SessionEnded(reason));
+      engine.on('disconnected', onLoss);
+      signal.addEventListener('abort', onAbort, { once: true });
+      try {
+        const join = await Promise.race([engine.connect(endpoint, session.token, session.options), interrupted]);
+        signal.throwIfAborted();
+        this.handleJoinResponse(join, restoring);
+        const early = this.earlyParticipantUpdates;
+        this.earlyParticipantUpdates = null;
+        for (const update of early ?? []) this.handleParticipantUpdate(update);
+        this.flushPendingTracks();
+        if (restoring && join.participant) {
+          await Promise.race([this.localParticipant.restore(engine), interrupted]);
+        }
+        signal.throwIfAborted();
+        session.serving = endpoint;
+        this._isConnected = true;
+        this.log = log;
+        return;
+      } catch (error) {
+        await this.releaseEngine(engine);
+        if (signal.aborted || !(error instanceof TransportError)) throw error;
+        // A token extension can replace the list while a previous attempt is in flight.
+        const next = session.urls.find(url => !attempted.has(url));
+        if (!next) throw error;
+        endpoint = next;
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+        engine.off('disconnected', onLoss);
+      }
+    }
+  }
+
+  private async recover(session: RoomSession, reason?: string): Promise<void> {
+    this._isConnected = false;
+    const priorEngine = this.engine;
+    this.localParticipant.detachTransport();
+    this.emit('reconnecting');
+    try {
+      await this.releaseEngine(priorEngine);
+      await this.joinRanked(session, true);
+      this.emit('reconnected');
+    } catch (error) {
+      if (this.session !== session) return;
+      this.session = undefined;
+      this.emit('disconnected', error instanceof SessionEnded ? error.message : reason);
+    }
+  }
+
+  private async releaseEngine(engine: RTCEngine): Promise<void> {
+    if (this.engine !== engine) return;
+    this.engine = new RTCEngine();
+    engine.removeAllListeners();
+    for (const participant of this.remoteParticipants.values()) {
+      participant.destroy();
+      this.emit('participantDisconnected', participant);
+    }
+    this.remoteParticipants.clear();
+    this.activeSpeakers = [];
+    this.pendingTracks = [];
+    this.earlyParticipantUpdates = [];
+    engine.signal.removeAllListeners();
+    await engine.disconnect();
+  }
+
+  /** Disconnect, including during the initial join or an automatic full restart. */
+  async disconnect(): Promise<void> {
+    if (!this.session && !this._isConnected) return;
+    const session = this.session;
+    this.session = undefined;
+    this._isConnected = false;
+    session?.controller.abort(new SessionEnded('client_initiated'));
+    await this.releaseEngine(this.engine);
     this.emit('disconnected', 'client_initiated');
   }
 
@@ -187,7 +270,7 @@ export class Room extends TypedEmitter<RoomEvents> {
 
   // ─── Private ────────────────────────────────────────────────────────────
 
-  private handleJoinResponse(join: JoinResponse): void {
+  private handleJoinResponse(join: JoinResponse, restoring = false): void {
     // Room info
     if (join.room) {
       this.roomInfo = join.room;
@@ -197,7 +280,8 @@ export class Room extends TypedEmitter<RoomEvents> {
     }
 
     // Local participant
-    if (join.participant) {
+    if (join.participant && restoring) this.localParticipant.updateInfo(join.participant);
+    if (join.participant && !restoring) {
       this.localParticipant = new LocalParticipant(
         this.engine,
         join.participant.sid,
@@ -221,11 +305,17 @@ export class Room extends TypedEmitter<RoomEvents> {
     });
 
     // WebRTC disconnected
-    this.engine.on('disconnected', (reason) => {
-      if (this._isConnected) {
-        this._isConnected = false;
-        this.emit('disconnected', reason);
+    this.engine.on('disconnected', (reason, transportFailure) => {
+      if (!this._isConnected) return;
+      const session = this.session;
+      if (transportFailure && session && session.urls.length > 1) {
+        void this.recover(session, reason);
+        return;
       }
+      this._isConnected = false;
+      this.session = undefined;
+      void this.releaseEngine(this.engine);
+      this.emit('disconnected', reason);
     });
 
     // Remote track received on subscriber
@@ -271,7 +361,7 @@ export class Room extends TypedEmitter<RoomEvents> {
 
     // Token refresh
     this.engine.signal.on('tokenRefresh', (token) => {
-      log.debug('Token refreshed');
+      this.updateConnectionToken(token);
     });
   }
 

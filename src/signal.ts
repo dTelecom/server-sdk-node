@@ -11,6 +11,7 @@
  */
 
 import WebSocket from 'ws';
+import { TransportError, SessionEnded } from './connection';
 import { TypedEmitter } from './utils/events';
 import { createLogger } from './utils/logger';
 import {
@@ -62,14 +63,14 @@ export interface SignalEvents {
   streamStateUpdate: (update: StreamStateUpdate) => void;
   leave: (request: LeaveRequest) => void;
   tokenRefresh: (token: string) => void;
-  close: (reason: string) => void;
+  close: (reason: string, retryable?: boolean) => void;
   error: (error: Error) => void;
 }
 
 export class SignalClient extends TypedEmitter<SignalEvents> {
   private ws: WebSocket | null = null;
   private _isConnected = false;
-  private joinResponse: JoinResponse | null = null;
+  private cancelJoin?: () => void;
 
   /** App-level ping interval timer (sends ping every pingInterval seconds). */
   private pingIntervalTimer: NodeJS.Timeout | null = null;
@@ -98,9 +99,18 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
     log.info(`Connecting to ${wsUrl.replace(/access_token=[^&]+/, 'access_token=***')}`);
 
     return new Promise<JoinResponse>((resolve, reject) => {
+      const finishJoin = () => {
+        clearTimeout(timeout);
+        this.cancelJoin = undefined;
+      };
+      this.cancelJoin = () => {
+        finishJoin();
+        reject(new SessionEnded('client_initiated'));
+      };
       const timeout = setTimeout(() => {
+        finishJoin();
+        reject(new TransportError(`Signal connection timed out after ${connectTimeout}ms`));
         this.close();
-        reject(new Error(`Signal connection timed out after ${connectTimeout}ms`));
       }, connectTimeout);
 
       try {
@@ -111,11 +121,19 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
         });
         this.ws.binaryType = 'arraybuffer';
       } catch (err) {
-        clearTimeout(timeout);
+        finishJoin();
         reject(err);
         return;
       }
 
+      this.ws.on('unexpected-response', (request, response) => {
+        const status = response.statusCode ?? 0;
+        finishJoin();
+        const message = `Signaling endpoint returned HTTP ${status}`;
+        reject(status >= 500 ? new TransportError(message) : new SessionEnded(message));
+        response.resume();
+        request.destroy();
+      });
       this.ws.on('open', () => {
         log.debug('WebSocket connected');
       });
@@ -127,12 +145,16 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
             : new Uint8Array(data as Buffer);
 
           const response = SignalResponse.decode(bytes);
+          if (response.leave && this.cancelJoin) {
+            finishJoin();
+            const reason = DisconnectReason[response.leave.reason];
+            reject(new SessionEnded(reason?.toLowerCase() ?? 'server_initiated'));
+          }
           this.handleResponse(response);
 
           // First message should be JoinResponse
           if (response.join) {
-            clearTimeout(timeout);
-            this.joinResponse = response.join;
+            finishJoin();
             this._isConnected = true;
 
             // Start app-level ping/pong using server-provided config.
@@ -152,22 +174,25 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
 
       this.ws.on('error', (err) => {
         log.error('WebSocket error', err);
-        clearTimeout(timeout);
-        this.emit('error', err instanceof Error ? err : new Error(String(err)));
-        reject(err);
+        finishJoin();
+        if (this.listenerCount('error')) this.emit('error', err);
+        reject(new TransportError(err.message));
       });
 
       this.ws.on('close', (code, reason) => {
-        clearTimeout(timeout);
+        const joining = Boolean(this.cancelJoin);
+        finishJoin();
         this._isConnected = false;
         this.stopPingInterval();
         const reasonStr = reason?.toString() || `code ${code}`;
         log.info(`WebSocket closed: ${reasonStr}`);
-        this.emit('close', reasonStr);
+        const retryable = code !== 1008 && code !== 4401 && code !== 4403;
+        this.emit('close', reasonStr, retryable);
 
         // If we haven't joined yet, reject
-        if (!this.joinResponse) {
-          reject(new Error(`WebSocket closed before join: ${reasonStr}`));
+        if (joining) {
+          const message = `WebSocket closed before join: ${reasonStr}`;
+          reject(retryable ? new TransportError(message) : new SessionEnded(message));
         }
       });
     });
@@ -214,10 +239,13 @@ export class SignalClient extends TypedEmitter<SignalEvents> {
 
   /** Close the WebSocket connection */
   close(): void {
+    this.cancelJoin?.();
     this.stopPingInterval();
     this._isConnected = false;
     if (this.ws) {
       this.ws.removeAllListeners();
+      // ws emits an error when a pending HTTP upgrade is deliberately closed.
+      this.ws.on('error', () => {});
       if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
         this.ws.close();
       }
