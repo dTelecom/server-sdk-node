@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0 (2026-11-26)
+
+- Pass Cloud’s ordered `fallbackUrls` to `room.connect(wsUrl, token, { fallbackUrls })`. If a node is unreachable, the SDK tries the next distinct endpoint with the same token. An authorization rejection ends the attempt. Existing calls with a single URL still work.
+- After transport loss, the SDK tries the serving node first and then the remaining ranked nodes. It restores published audio tracks when the connection returns and emits `reconnecting` and `reconnected`. Pass renewed credentials to `room.updateConnectionToken(token, fallbackUrls)` for future reconnects.
+
 ## 0.3.3 (2026-11-23)
 
 - A bot that joins a room where someone already publishes now receives that track. `Room.connect()` added its listeners only after the connection was up, so tracks and participant updates the node sent during the join (about 5 seconds of ICE) were lost: an agent that joined after the user turned the microphone on heard nothing until something made the node renegotiate. Listeners are now in place before the join; participant updates from that window are applied in order once the join completes, and tracks that arrived before their participant was known are matched at once.
